@@ -188,6 +188,7 @@ cdef class QRMSAEnv:
     cdef int bl_resource 
     cdef int bl_osnr 
     cdef int bl_reject
+    cdef int spectrum_efficiency_metric
 
     topology: cython.declare(nx.Graph, visibility="readonly")
     bit_rate_selection: cython.declare(Literal["continuous", "discrete"], visibility="readonly")
@@ -218,7 +219,7 @@ cdef class QRMSAEnv:
         channel_width: double = 12.5,
         k_paths: int = 5,
         file_name: str = "",
-        blocks_to_consider: int = 4
+        blocks_to_consider: int = 1
     ):
         self.rng = random.Random()
         self.blocks_to_consider = blocks_to_consider
@@ -301,15 +302,15 @@ cdef class QRMSAEnv:
         )
 
         total_dim = (
-            1
-            + (2 * self.topology.number_of_nodes())
+                1
+            + 2
             + self.k_paths
-            + (self.k_paths * len(self.modulations) * (2 * self.blocks_to_consider + 5))
+            + (self.k_paths * len(self.modulations) * (2 * self.blocks_to_consider + 6))
         )
 
         self.observation_space = gym.spaces.Box(
-                low=-10.0,
-                high=10.0,
+                low=-5,
+                high=5,
                 shape=(total_dim,),
                 dtype=np.float32
             )
@@ -388,6 +389,7 @@ cdef class QRMSAEnv:
         self.bl_osnr = 0
         self.bl_resource = 0
         self.bl_reject = 0
+        self.spectrum_efficiency_metric = 0
         if reset:
             self.reset()
 
@@ -478,7 +480,7 @@ cdef class QRMSAEnv:
     
 
     def observation(self):
-        # ============== 1) Leitura de variáveis externas ==============
+
         topology = self.topology
         # print("Topology loaded:", topology)
         
@@ -535,7 +537,7 @@ cdef class QRMSAEnv:
         
         num_metrics_per_modulation = 2 * num_blocks_to_consider + 6
         # print("Number of metrics per modulation:", num_metrics_per_modulation)
-        # Nota: aumentamos 1 métrica para a 'utilização média do link' (ver item 3 da sua solicitação)
+        # Nota: aumentamos 1 métrica para a 'utilização média do link'
         # Antes eram 2 * blocks_to_consider + 5
 
         # ============== 4) Estrutura para armazenar espectro ==============
@@ -1050,7 +1052,7 @@ cdef class QRMSAEnv:
                     self.current_service.ASE = ase
                     self.current_service.NLI = nli
                     self.current_service.current_modulation = modulation
-
+                    self.spectrum_efficiency_metric += modulation.spectral_efficiency
                     # Atualiza histograma de modulações
                     self.episode_modulation_histogram[modulation.spectral_efficiency] += 1
 
@@ -1177,7 +1179,7 @@ cdef class QRMSAEnv:
         if not action == (self.action_space.n - 1):
             reward = self.reward()
         else:
-            reward = -5.0
+            reward = -6.0
         info = {
             "episode_services_accepted": self.episode_services_accepted,
             "service_blocking_rate": 0.0,
@@ -1412,37 +1414,49 @@ cdef class QRMSAEnv:
         return True
 
     cpdef double reward(self):
-        cdef bint accepted = self.current_service.accepted
-        if not accepted:
-            return ( -2*(float(self.episode_services_processed - self.episode_services_accepted)
-            ) / float(self.episode_services_processed))
 
-        # Recupera parâmetros do serviço
-        cdef double osnr = self.current_service.OSNR
-        cdef double min_osnr = self.current_service.current_modulation.minimum_osnr
-        cdef double osnr_diff = osnr - min_osnr
-        cdef double se = self.current_service.current_modulation.spectral_efficiency
+        cdef double reward_value
+        cdef failed_ratio = (float(self.episode_services_processed - self.episode_services_accepted)
+            ) / float(self.episode_services_processed)
 
-        # Cálculo simples:
-        #
-        #    reward = 1.0
-        #            - α * |osnr_diff|    [penaliza sobras de OSNR]
-        #            + β * se            [recompensa maior eficiência espectral]
-        #
-        # Clampa para [0,1] ao final.
+        if not self.current_service.accepted:
+            return -3.0*(1+2*failed_ratio)
 
-        cdef double alpha = 0.3 #Penaliza quanto maior for a diferença entre a OSNR real e a mínima necessária.
-        cdef double beta = 0.6 #Recompensa modulações com maior eficiência espectral.
+        reward_value = 1.0
 
-        cdef double reward_value = 1.0 - alpha * abs(osnr_diff) + beta * se
+        cdef double current_se = self.current_service.current_modulation.spectral_efficiency
+        reward_value += 0.1 * current_se  # e.g. +0.6 if SE=6
 
-        # Mantém a recompensa entre 0 e 1
-#        if reward_value > 1.0:
-#            reward_value = 1.0
-#        elif reward_value < 0.0:
-#            reward_value = 0.0
+        # 4) OSNR penalties/bonuses
+        cdef double current_osnr     = self.current_service.OSNR
+        cdef bint has_next = False
+        cdef double next_min_osnr = 99
+        cdef double next_se       = 0.0
 
+        for m in self.modulations:
+            if m.spectral_efficiency > current_se and m.minimum_osnr < next_min_osnr:
+                next_min_osnr = m.minimum_osnr
+                next_se       = m.spectral_efficiency
+                has_next      = True
+
+        if has_next and current_osnr >= next_min_osnr:
+            # We *could* have used a bigger modulation => small penalty
+            # keep it smaller than the base acceptance reward
+            reward_value -= 0.2 * (current_osnr - next_min_osnr)**0.5
+
+        # 6) (Optional) small overall "spectral efficiency" bonus, but scaled down
+        # so it doesn't blow up the reward across the entire episode:
+        cdef double efficiency_avg = self.spectrum_efficiency_metric / self.episode_services_processed
+        if self.episode_services_processed > 0:
+            reward_value += 0.05 * efficiency_avg  # smaller coefficient, e.g. 0.05
+
+        # 7) Finally, clamp the reward to keep it in a sane range:
+        if reward_value > 3.0:
+            reward_value = 3.0
+        if reward_value < -3.0:
+            reward_value = -3.0
         return reward_value
+
 
     
     cpdef _provision_path(self, object path, cnp.int64_t initial_slot, int number_slots):
