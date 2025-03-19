@@ -15,6 +15,7 @@ from optical_networking_gym.heuristics.heuristics import (
     shortest_available_path_lowest_spectrum_best_modulation,
     best_modulation_load_balancing,
     load_balancing_best_modulation,
+    heuristic_from_mask
 )
 from optical_networking_gym.topology import Modulation, get_topology
 
@@ -46,7 +47,7 @@ def create_environment():
     """
     # Topologia (caminho usado no PPO) e modulações
     topology_name = "ring_4"  # Nome de referência
-    topology_path = rf"C:\Users\talle\Documents\Mestrado\optical-networking-gym\examples\topologies\ring_4.txt"
+    topology_path = rf"C:\Users\talle\Documents\Mestrado\optical-networking-gym\examples\topologies\nobel-eu.xml"#ring_4.txt"
     cur_modulations = define_modulations()
 
     # Cria objeto de topologia
@@ -57,7 +58,7 @@ def create_environment():
         80,    # Ex: Distância máxima entre amplificadores (ou outro parâmetro da topologia)
         0.2,   # Atenuação
         4.5,   # Noise figure
-        2      # k_paths
+        5      # k_paths
     )
 
     # Parâmetros do ambiente (iguais ao PPO)
@@ -70,18 +71,19 @@ def create_environment():
         seed=seed,
         allow_rejection=True,
         load=210,                    # Mesmo load do PPO
-        episode_length=1000,         # Mesmo episode_length do PPO
-        num_spectrum_resources=15,  # Mesmo número de slots do PPO
+        episode_length=100,         # Mesmo episode_length do PPO
+        num_spectrum_resources=320,  # Mesmo número de slots do PPO
         launch_power_dbm=0,          # Mesmo launch power do PPO
         frequency_slot_bandwidth=12.5e9,
         frequency_start=3e8 / 1565e-9,
-        bandwidth= 15* 12.5e9,
+        bandwidth= 320* 12.5e9,
         bit_rate_selection="discrete",
-        bit_rates=(10, 40),#,100, 400),
+        bit_rates=(10, 40 ,100, 400),
         margin=0,
         measure_disruptions=False,
         file_name="",  # Podemos deixar vazio, pois não estamos logando em cada step
-        k_paths=1,     # Mesmo valor do PPO
+        k_paths=5,     # Mesmo valor do PPO
+        modulations_to_consider=2,  # Mesmo valor do PPO
     )
     return topology, env_args
 
@@ -105,7 +107,7 @@ def run_first_fit_environment(
     :param csv_output: caminho do CSV de saída.
     """
     # Seleciona a função da heurística (first-fit)
-    fn_heuristic = shortest_available_path_first_fit_best_modulation
+    fn_heuristic = heuristic_from_mask#shortest_available_path_first_fit_best_modulation
     # fn_heuristic = best_modulation_load_balancing
     
     # Cria instância do ambiente
@@ -153,15 +155,15 @@ def run_first_fit_environment(
             start_time = time.time()
 
             while not done:
-                print(f"current service: {env.unwrapped.env.current_service}")
-                action, bl_osnr, bl_resource = fn_heuristic(env.unwrapped.env)
+                # print(f"current service: {env.unwrapped.env.current_service}")
+                action, bl_osnr, bl_resource = fn_heuristic(env.unwrapped.env, info["mask"]), 0 ,0 
                 if bl_osnr:
                     osnr_count += 1
                 if bl_resource:
                     resource_count += 1               
                 obs, reward, terminated, truncated, info = env.step(action)
-                print("================= step =================")
-                print(f"Action: {action}, unwraped action: {env.unwrapped.env.decimal_to_array(int(action))}")
+#                print("================= step =================")
+                # print(f"Action: {action}, unwraped action: {env.unwrapped.env.decimal_to_array(int(action))}")
                 for lnk in env.unwrapped.env.topology.edges():
                     index = env.unwrapped.env.topology[lnk[0]][lnk[1]]["index"]
                     # print(f"Link {lnk}: {env.unwrapped.env.topology.graph["available_slots"][index,:]}")
