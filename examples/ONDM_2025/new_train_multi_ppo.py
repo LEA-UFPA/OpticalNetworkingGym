@@ -33,12 +33,12 @@ def define_modulations() -> Tuple[Modulation, ...]:
     Define e retorna as modulações utilizadas no ambiente.
     """
     return (
-        Modulation(name="BPSK",  maximum_length=100000, spectral_efficiency=1,  minimum_osnr=12.6, inband_xt=-14),
-        Modulation(name="QPSK",  maximum_length=2000,   spectral_efficiency=2,  minimum_osnr=12.6, inband_xt=-17),
-        Modulation(name="8QAM",  maximum_length=1000,   spectral_efficiency=3,  minimum_osnr=18.6, inband_xt=-20),
-        Modulation(name="16QAM", maximum_length=500,    spectral_efficiency=4,  minimum_osnr=22.4, inband_xt=-23),
-        Modulation(name="32QAM", maximum_length=250,    spectral_efficiency=5,  minimum_osnr=26.4, inband_xt=-26),
-        Modulation(name="64QAM", maximum_length=125,    spectral_efficiency=6,  minimum_osnr=30.4, inband_xt=-29),
+        Modulation(name="BPSK",  maximum_length=100000, spectral_efficiency=1,  minimum_osnr=3.71925646843142, inband_xt=-14),
+        Modulation(name="QPSK",  maximum_length=2000,   spectral_efficiency=2,  minimum_osnr=6.72955642507124, inband_xt=-17),
+        Modulation(name="8QAM",  maximum_length=1000,   spectral_efficiency=3,  minimum_osnr=10.8453935345953, inband_xt=-20),
+        Modulation(name="16QAM", maximum_length=500,    spectral_efficiency=4,  minimum_osnr=13.2406469649752, inband_xt=-23),
+        Modulation(name="32QAM", maximum_length=250,    spectral_efficiency=5,  minimum_osnr=16.1608982942870, inband_xt=-26),
+        Modulation(name="64QAM", maximum_length=125,    spectral_efficiency=6,  minimum_osnr=19.0134649345090, inband_xt=-29),
     )
 
 
@@ -61,10 +61,10 @@ def create_environment_config():
         topology_path,
         topology_name,
         cur_modulations,
-        80,       # Número de canais? Ajuste conforme a topologia
-        0.2,      # Fator de ruído (exemplo)
-        4.5,      # Outra config. de ruído (exemplo)
-        5         # Exemplo de config. adicional
+        80,       
+        0.2,      
+        4.5,      
+        5         
     )
 
     # Parâmetros gerais do ambiente
@@ -73,8 +73,8 @@ def create_environment_config():
     np.random.seed(seed)
 
     episode_length = 1_000  # Cada episódio com 1000 steps
-    load = 210
-    launch_power = 0
+    load = 500
+    launch_power = 2
     num_slots = 320
     frequency_slot_bandwidth = 12.5e9
     frequency_start = 3e8 / 1565e-9
@@ -100,7 +100,7 @@ def create_environment_config():
         k_paths=5,
     )
 
-    num_envs = 14  # 14 threads/ambientes paralelos
+    num_envs = 16  # 14 threads/ambientes paralelos
     return topology, env_args, seed, num_envs
 
 
@@ -151,7 +151,7 @@ class SingleCallback(BaseCallback):
         # Parâmetros do scheduler de ent_coef
         initial_ent_coef: float = 0.03,
         final_ent_coef: float = 0.01,
-        schedule_timesteps: int = 4_500_000,
+        schedule_timesteps: int = 9_500_000,
         # Parâmetros do ExplorationBoost
         check_interval: int = 200,
         threshold: float = 0.1,
@@ -367,11 +367,11 @@ def main():
     model = MaskablePPO(
         policy="MlpPolicy",
         env=vec_env,
-        learning_rate=linear_schedule(4e-4),  # LR decai linearmente até 0
+        learning_rate=linear_schedule(3e-4),  # LR decai linearmente até 0
         n_steps=1024,
-        batch_size=64,
+        batch_size=128,
         gamma=0.99,
-        gae_lambda=0.95,
+        gae_lambda=0.96,
         ent_coef=0.03,
         clip_range=0.2,
         verbose=1,
@@ -382,7 +382,7 @@ def main():
 
     # (C) Criar callback único
     single_callback = SingleCallback(
-        max_episodes=20_000,  # 10.000 episódios
+        max_episodes=15_000,  # 10.000 episódios
         verbose=1
     )
 
