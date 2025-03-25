@@ -365,5 +365,5 @@ cpdef double calculate_osnr_observation(
     # GSNR final
     gsnr = 10.0 * log10(1.0 / acc_gsnr)
     # Normalização
-    cdef double normalized_gsnr = np.round((gsnr - gsnr_th) / abs(gsnr_th), 5)
+    cdef double normalized_gsnr = np.round((gsnr - gsnr_th) / abs(gsnr_th), 10)
     return normalized_gsnr

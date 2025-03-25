@@ -310,7 +310,7 @@ cdef class QRMSAEnv:
             1
             + 2
             + self.k_paths
-            + (self.k_paths * self.modulations_to_consider * (2 * self.blocks_to_consider + 6))
+            + (self.k_paths * self.modulations_to_consider * (2 + 6))
         )
 
         self.observation_space = gym.spaces.Box(
@@ -547,41 +547,42 @@ cdef class QRMSAEnv:
                         self.current_service.launch_power = 0.0
 
                         if osnr >= modulation.minimum_osnr + self.margin:
+                            print("Modulação válida encontrada: ", modulation)
                             self.max_modulation_idx = max(len(self.modulations) - idm - 1,
-                                                        len(self.modulations) - self.modulations_to_consider - 1)
+                                                        self.modulations_to_consider - 1)
                             return
-        self.max_modulation_idx = len(self.modulations) - self.modulations_to_consider - 1
+        self.max_modulation_idx = self.modulations_to_consider - 1
 
     def observation(self):
-        def compute_modulation_features(available_slots, num_slots_required, route_links):
-            valid_starts = self._get_candidates(available_slots, num_slots_required, num_spectrum_resources)
+        def compute_modulation_features(available_slots, num_slots_required, route_links, modulation):
+            valid_starts = self._get_candidates(available_slots, num_slots_required, self.num_spectrum_resources)
             candidate_count = len(valid_starts)
-            feature_candidate_count = candidate_count / num_spectrum_resources
+            feature_candidate_count = candidate_count / self.num_spectrum_resources
             if candidate_count > 0:
                 avg_candidate = np.mean(valid_starts)
                 std_candidate = np.std(valid_starts)
                 max_candidate = max(valid_starts)
             else:
                 avg_candidate = std_candidate = max_candidate = 0.0
-            feature_avg_candidate = avg_candidate / (num_spectrum_resources - 1)
-            feature_std_candidate = std_candidate / (num_spectrum_resources - 1)
-            feature_max_candidate = max_candidate / (num_spectrum_resources - 1)
+            feature_avg_candidate = avg_candidate / (self.num_spectrum_resources - 1)
+            feature_std_candidate = std_candidate / (self.num_spectrum_resources - 1)
+            feature_max_candidate = max_candidate / (self.num_spectrum_resources - 1)
             
             osnr_values = []
             osnr_best = 0.0
             for init_slot in valid_starts:
-                service_bandwidth = num_slots_required * frequency_slot_bandwidth
+                service_bandwidth = num_slots_required * self.channel_width * 1e9
                 service_center_frequency = (
                     self.frequency_start +
-                    (frequency_slot_bandwidth * init_slot) +
-                    (frequency_slot_bandwidth * (num_slots_required / 2.0))
+                    (self.channel_width * 1e9 * init_slot) +
+                    (self.channel_width * 1e9 * (num_slots_required / 2.0))
                 )
                 osnr_current = calculate_osnr_observation(
                     self,
                     route_links,
                     service_bandwidth,
                     service_center_frequency,
-                    current_service.service_id,
+                    self.current_service.service_id,
                     10 ** ((self.launch_power_dbm - 30) / 10),
                     modulation.minimum_osnr
                 )
@@ -597,7 +598,7 @@ cdef class QRMSAEnv:
             adjusted_slots_required = max((num_slots_required - 5.5) / 3.5, 0.0)
             
             total_available_slots = np.sum(available_slots)
-            total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * num_spectrum_resources) / num_spectrum_resources
+            total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * self.num_spectrum_resources) / self.num_spectrum_resources
             
             blocks_sizes = []
             current_len = 0
@@ -616,7 +617,7 @@ cdef class QRMSAEnv:
             else:
                 mean_block_size = std_block_size = 0.0
             
-            link_usage_normalized = 2.0 * ((available_slots.sum() / num_spectrum_resources) - 0.5)
+            link_usage_normalized = 2.0 * ((np.sum(available_slots) / self.num_spectrum_resources) - 0.5)
             
             features = [feature_candidate_count,
                         feature_avg_candidate,
@@ -632,6 +633,9 @@ cdef class QRMSAEnv:
                         feature_max_candidate]
             return valid_starts, features, osnr_values
 
+        # ========================
+        # Observações comuns
+        # ========================
         topology = self.topology
         current_service = self.current_service
         num_spectrum_resources = self.num_spectrum_resources
@@ -641,152 +645,163 @@ cdef class QRMSAEnv:
         num_nodes = topology.number_of_nodes()
         frequency_slot_bandwidth = self.channel_width * 1e9
         max_bit_rate = max(self.bit_rates)
-        
         self.get_max_modulation_index()
-        
+
         source_id = int(current_service.source_id)
         destination_id = int(current_service.destination_id)
         source_norm = source_id / (num_nodes - 1) if num_nodes > 1 else 0
         destination_norm = destination_id / (num_nodes - 1) if num_nodes > 1 else 0
-        source_destination_tau = np.array([source_norm, destination_norm], dtype=np.float32)
-        
-        num_paths_to_evaluate = self.k_paths
-        num_blocks_to_consider = self.blocks_to_consider
-        num_metrics_per_modulation = 12  
-        
-        spectrum_obs = np.full((num_paths_to_evaluate, num_mod_to_consider, num_metrics_per_modulation),
-                                fill_value=-1.0, dtype=np.float32)
-        
-        action_mask = np.zeros(self.action_space.n, dtype=np.uint8)
-        
-        link_lengths = [topology[x][y]["length"] for x, y in topology.edges()]
-        min_lengths = min(link_lengths)
-        max_lengths = max(link_lengths)
-        
-        route_lengths = np.zeros((num_paths_to_evaluate, 1), dtype=np.float32)
-        
+        source_destination = np.array([source_norm, destination_norm], dtype=np.float32)
+
         bit_rate_obs = np.array([current_service.bit_rate / max_bit_rate], dtype=np.float32)
-        
-        for path_index, route in enumerate(k_shortest_paths[current_service.source, current_service.destination]):
+
+        num_paths_to_evaluate = self.k_paths
+        # Obter os comprimentos dos links para normalização das rotas
+        link_lengths = [topology[x][y]["length"] for x, y in topology.edges()]
+        min_length = min(link_lengths)
+        max_length = max(link_lengths)
+        route_lengths = np.zeros((num_paths_to_evaluate,), dtype=np.float32)
+
+        # Pré-cálculo das informações de cada caminho: (route, available_slots)
+        paths_info = []
+        source = current_service.source
+        destination = current_service.destination
+        for path_index, route in enumerate(k_shortest_paths[source, destination]):
             if path_index >= num_paths_to_evaluate:
                 break
-            
-            normalized_length = self.normalize_value(route.length, min_lengths, max_lengths)
-            route_lengths[path_index, 0] = normalized_length
-            
+            normalized_length = self.normalize_value(route.length, min_length, max_length)
+            route_lengths[path_index] = normalized_length
             available_slots = self.get_available_slots(route)
-            
-            mean_link_usage = available_slots.sum() / num_spectrum_resources
-            
-            mod_list = list(reversed(modulations[self.max_modulation_idx + 1 - num_mod_to_consider:
-                                                self.max_modulation_idx + 1]))
-            
-            for modulation_index, modulation in enumerate(mod_list):
+            paths_info.append((route, available_slots))
+
+        # ========================
+        # Cálculo das features de observação por (caminho, modulação)
+        # ========================
+        mod_features_obs = np.full((num_paths_to_evaluate * num_mod_to_consider, 12), fill_value=-1.0, dtype=np.float32)
+        mod_features_cache = {}
+        for p_idx in range(num_paths_to_evaluate):
+            route, available_slots = paths_info[p_idx]
+            start_index = 0 if self.max_modulation_idx <= 1 else max(0, self.max_modulation_idx - (num_mod_to_consider - 1))
+            mod_list = list(reversed(modulations[start_index: num_mod_to_consider + start_index]))
+            for m_idx in range(num_mod_to_consider):
+                modulation = mod_list[m_idx]
                 num_slots_required = self.get_number_slots(current_service, modulation)
-                
-                valid_starts, osnr_values, _ = compute_modulation_features(available_slots, num_slots_required, route.links)
-                
-                candidate_count = len(valid_starts)
-                feature_candidate_count = candidate_count / num_spectrum_resources
-                if candidate_count > 0:
-                    avg_candidate = np.mean(valid_starts)
-                    std_candidate = np.std(valid_starts)
-                    max_candidate = max(valid_starts)
-                else:
-                    avg_candidate = std_candidate = max_candidate = 0.0
-                feature_avg_candidate = avg_candidate / (num_spectrum_resources - 1)
-                feature_std_candidate = std_candidate / (num_spectrum_resources - 1)
-                feature_max_candidate = max_candidate / (num_spectrum_resources - 1)
-                
-                if osnr_values:
-                    osnr_best = max(osnr_values)
-                    osnr_mean = np.mean(osnr_values)
-                    osnr_var = np.var(osnr_values)
-                else:
-                    osnr_best = osnr_mean = osnr_var = 0.0
-                
-                adjusted_slots_required = max((num_slots_required - 5.5) / 3.5, 0.0)
-                total_available_slots = np.sum(available_slots)
-                total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * num_spectrum_resources) / num_spectrum_resources
-                
-                blocks_sizes = []
-                current_len = 0
-                for slot in available_slots:
-                    if slot == 1:
-                        current_len += 1
-                    else:
-                        if current_len > 0:
-                            blocks_sizes.append(current_len)
-                        current_len = 0
-                if current_len > 0:
-                    blocks_sizes.append(current_len)
-                if blocks_sizes:
-                    mean_block_size = ((np.mean(blocks_sizes) - 4.0) / 4.0) / 100.0
-                    std_block_size = (np.std(blocks_sizes) / 100.0)
-                else:
-                    mean_block_size = std_block_size = 0.0
-                
-                link_usage_normalized = 2.0 * (mean_link_usage - 0.5)
-                
-                features = [feature_candidate_count,
-                            feature_avg_candidate,
-                            feature_std_candidate,
-                            adjusted_slots_required,
-                            total_available_slots_ratio,
-                            mean_block_size,
-                            std_block_size,
-                            osnr_best,
-                            osnr_mean,
-                            osnr_var,
-                            link_usage_normalized,
-                            feature_max_candidate]
-                
-                spectrum_obs[path_index, modulation_index, :] = np.array(features, dtype=np.float32)
-                
-                for init_slot in valid_starts:
-                    service_bandwidth = num_slots_required * frequency_slot_bandwidth
-                    service_center_frequency = (
-                        self.frequency_start +
-                        (frequency_slot_bandwidth * init_slot) +
-                        (frequency_slot_bandwidth * (num_slots_required / 2.0))
-                    )
-                    osnr_current = calculate_osnr_observation(
-                        self,
-                        route.links,
-                        service_bandwidth,
-                        service_center_frequency,
-                        current_service.service_id,
-                        10 ** ((self.launch_power_dbm - 30) / 10),
-                        modulation.minimum_osnr
-                    )
-                    if osnr_current > 0:
-                        action_index = (path_index * num_mod_to_consider * num_spectrum_resources +
-                                        modulation_index * num_spectrum_resources +
-                                        init_slot)
-                        if action_index < self.action_space.n:
-                            action_mask[action_index] = 1
-            
-            action_mask[-1] = 1
-        
-        source_destination_flat = source_destination_tau.flatten().astype(np.float32)
-        route_lengths_flat = route_lengths.flatten().astype(np.float32)
-        spectrum_obs_flat = spectrum_obs.flatten().astype(np.float32)
-        observation = np.concatenate([bit_rate_obs, source_destination_flat, route_lengths_flat, spectrum_obs_flat], axis=0).astype(np.float32)
-        
+                valid_starts, features, osnr_values = compute_modulation_features(available_slots, num_slots_required, route.links, modulation)
+                mod_features_obs[p_idx * num_mod_to_consider + m_idx, :] = np.array(features, dtype=np.float32)
+                mod_features_cache[(p_idx, m_idx)] = (valid_starts, features, num_slots_required, modulation)
+
+        # ========================
+        # Geração da máscara de ações (permanece inalterada)
+        # ========================
+        total_actions = num_paths_to_evaluate * num_mod_to_consider * num_spectrum_resources
+        action_mask = np.zeros(total_actions + 1, dtype=np.uint8)
+
+        for action_index in range(total_actions):
+            p_idx = action_index // (num_mod_to_consider * num_spectrum_resources)
+            mod_and_slot = action_index % (num_mod_to_consider * num_spectrum_resources)
+            m_idx = mod_and_slot // num_spectrum_resources
+            init_slot = mod_and_slot % num_spectrum_resources
+
+            route, available_slots = paths_info[p_idx]
+            # Recupera os dados de modulação do cache
+            valid_starts, features, num_slots_required, modulation = mod_features_cache[(p_idx, m_idx)]
+
+            valid_action = False
+            osnr_current = 0.0
+            if init_slot in valid_starts:
+                service_bandwidth = num_slots_required * frequency_slot_bandwidth
+                service_center_frequency = (
+                    self.frequency_start +
+                    (frequency_slot_bandwidth * init_slot) +
+                    (frequency_slot_bandwidth * (num_slots_required / 2.0))
+                )
+                osnr_current = calculate_osnr_observation(
+                    self,
+                    route.links,
+                    service_bandwidth,
+                    service_center_frequency,
+                    current_service.service_id,
+                    10 ** ((self.launch_power_dbm - 30) / 10),
+                    modulation.minimum_osnr
+                )
+                if osnr_current >= 0:
+                    valid_action = True
+
+            if valid_action:
+                action_mask[action_index] = 1
+
+        # Define a ação dummy (última posição) como válida
+        action_mask[-1] = 1
+
+        # ========================
+        # Construção final da observação
+        # ========================
+        # As features de ação agora vêm de mod_features_obs, que tem dimensão:
+        # (k_paths * modulations_to_consider, 12)
+        spectrum_obs_flat = mod_features_obs.flatten().astype(np.float32)
+        observation = np.concatenate([
+            bit_rate_obs,                         # 1 valor
+            source_destination.flatten(),         # 2 valores
+            route_lengths.flatten(),              # k_paths valores
+            spectrum_obs_flat                     # (k_paths * modulations_to_consider * 12) valores
+        ], axis=0).astype(np.float32)
+
         return observation, {'mask': action_mask}
+
+
 
     def decimal_to_array(self, decimal: int, max_values: list[int] = None) -> list[int]:
         if max_values is None:
-            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
-        
+            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]       
         array = []
         for max_val in reversed(max_values):
-            array.insert(0, decimal % max_val)
+            digit = decimal % max_val
+            array.insert(0, digit)
             decimal //= max_val
-
-        allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - self.modulations_to_consider, -1))
+        if self.max_modulation_idx > 1:
+            allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - (self.modulations_to_consider - 1), -1))
+        else:
+            allowed_mods = list(range(0, self.modulations_to_consider))
         array[1] = allowed_mods[array[1]]
+        # print(f"k:{self.k_shortest_paths[self.current_service.source,self.current_service.destination][array[0]]}, mod: {self.modulations[array[1]]}, slot: {array[2]}")
         return array
+
+    def encoded_decimal_to_array(self, decimal: int, max_values: list[int] = None) -> list[int]:
+        # Usa divisão inteira para garantir um valor inteiro para part_size.
+        part_size = self.num_spectrum_resources // self.modulations_to_consider  
+        mod_idx = decimal // part_size  # Calculado mas não usado para modulação
+        # print(f"Input decimal: {decimal}")
+        
+        if max_values is None:
+            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
+        # print(f"Max values: {max_values}")
+        
+        array = []
+        # Decomposição do número decimal com base nos valores máximos (ordem: [k_path, modulação, slot])
+        for max_val in reversed(max_values):
+            digit = decimal % max_val
+            # print(f"Current max_val: {max_val}, digit: {digit}")
+            array.insert(0, digit)
+            decimal //= max_val
+            # print(f"Updated decimal: {decimal}")
+        
+        # Cria a lista de modulações permitidas
+        if self.max_modulation_idx > 1:
+            # Remove o 'reversed' para manter a ordem desejada: maior para menor.
+            allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - self.modulations_to_consider, -1))
+        else:
+            allowed_mods = list(reversed(list(range(0, self.modulations_to_consider))))
+        # print(f"Allowed mods: {allowed_mods}")
+        
+        # Atualiza o dígito de modulação usando o dígito extraído da decomposição
+        array[1] = allowed_mods[array[1]]
+        # print(f"Decoded array: {array}")
+        # print(f"k: {self.k_shortest_paths[self.current_service.source, self.current_service.destination][array[0]]}, "
+        #     f"mod: {self.modulations[array[1]]}, slot: {array[2]}")
+        
+        return array
+
+
 
     cpdef tuple[object, float, bint, bint, dict] step(self, int action):
         cdef int route = -1
@@ -817,9 +832,9 @@ cdef class QRMSAEnv:
             self.current_service.blocked_due_to_osnr = False
             self.bl_reject += 1
         else:
-            decoded = self.decimal_to_array(
+            decoded = self.encoded_decimal_to_array(
                 action,
-                [self.k_paths, len(self.modulations), self.num_spectrum_resources]
+                [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
             )
             route = decoded[0]
             modulation_idx = decoded[1]

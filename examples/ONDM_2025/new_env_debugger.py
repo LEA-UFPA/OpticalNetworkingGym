@@ -145,12 +145,12 @@ def run_first_fit_environment(
             print(f"===== Episódio {ep} =====")
             obs, info = env.reset()
             print("================= reset =================")
-            for lnk in env.unwrapped.env.topology.edges():
-                index = env.unwrapped.env.topology[lnk[0]][lnk[1]]["index"]
-                print(f"Link {lnk}: {env.unwrapped.env.topology.graph["available_slots"][index,:]}")
-                print(f"running services:" )
-                print(f"{env.unwrapped.env.topology[lnk[0]][lnk[1]]["running_services"]}")
-            print("================= reset =================")
+            # for lnk in env.unwrapped.env.topology.edges():
+            #     index = env.unwrapped.env.topology[lnk[0]][lnk[1]]["index"]
+            #     print(f"Link {lnk}: {env.unwrapped.env.topology.graph["available_slots"][index,:]}")
+            #     print(f"running services:" )
+            #     print(f"{env.unwrapped.env.topology[lnk[0]][lnk[1]]["running_services"]}")
+            # print("================= reset =================")
             done = False
             start_time = time.time()
 
@@ -205,10 +205,8 @@ def run_first_fit_environment(
 # 4. Rotina Principal
 # ===================================================
 def main():
-    # (A) Carregamos a topologia e parâmetros do ambiente (iguais ao PPO)
     topology, env_args = create_environment()
 
-    # (B) Definimos o número de episódios para 5
     n_eval_episodes = 2
 
     # (C) Executamos a heurística First-Fit e salvamos em CSV
