@@ -49,6 +49,8 @@ def run_environment(
     margin,
     file_name,
     measure_disruptions,
+    defragmentation,
+    n_defrag_services,
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
@@ -78,6 +80,7 @@ def run_environment(
         shortest_available_path_lowest_spectrum_best_modulation,
         best_modulation_load_balancing,
         load_balancing_best_modulation,
+        rnd,
     )
 
     # Configurações do ambiente
@@ -98,14 +101,16 @@ def run_environment(
         file_name=file_name,
         measure_disruptions=measure_disruptions,
         k_paths=5, 
-        modulations_to_consider=2, 
+        modulations_to_consider=2,
+        defragmentation=defragmentation,
+        n_defrag_services=n_defrag_services, 
     )
 
     # Seleção da heurística baseada no índice
     if heuristic == 1:
         fn_heuristic = shortest_available_path_first_fit_best_modulation
     elif heuristic == 2:
-        fn_heuristic = shortest_available_path_lowest_spectrum_best_modulation
+        fn_heuristic = rnd#shortest_available_path_lowest_spectrum_best_modulation
     elif heuristic == 3:
         fn_heuristic = best_modulation_load_balancing
     elif heuristic == 4:
@@ -194,13 +199,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=1000,
+        default=10000,
         help='Número de chegadas por episódio (default: 1000)'
     )
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=10,
+        default=1,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -311,28 +316,31 @@ def main():
     # Preparação dos argumentos de simulação para cada combinação de carga e estratégia
     env_args = []
     for current_load in loads:
-        for strategy in [1]:
-            sim_args = (
-                args.num_episodes,              # n_eval_episodes
-                strategy,                       # heuristic_index
-                f"{args.monitor_file_name}_{strategy}",  # monitor_file_name base
-                topology,                       # topology
-                seed,                           # seed
-                True,                           # allow_rejection
-                current_load,                   # load (varia)
-                args.episode_length,            # episode_length
-                320,                            # num_spectrum_resources
-                launch_power,                   # launch_power_dbm
-                bandwidth,                      # bandwidth
-                frequency_start,                # frequency_start
-                frequency_slot_bandwidth,       # frequency_slot_bandwidth
-                "discrete",                     # bit_rate_selection
-                bit_rates,                      # bit_rates
-                margin,                         # margin
-                f"examples/jocn_benchmark_2024/results/load_services_{strategy}",  # file_name para serviços
-                False,                          # measure_disruptions
-            )
-            env_args.append(sim_args)
+        for strategy in [1, 2]:
+            for mensure in [[False,0], [True, 10], [True, 50], [True, 0]]:
+                sim_args = (
+                    args.num_episodes,              # n_eval_episodes
+                    strategy,                       # heuristic_index
+                    f"{args.monitor_file_name}_{strategy}_def_{mensure[0]}_{mensure[1]}",  # monitor_file_name base
+                    topology,                       # topology
+                    seed,                           # seed
+                    True,                           # allow_rejection
+                    current_load,                   # load (varia)
+                    args.episode_length,            # episode_length
+                    320,                            # num_spectrum_resources
+                    launch_power,                   # launch_power_dbm
+                    bandwidth,                      # bandwidth
+                    frequency_start,                # frequency_start
+                    frequency_slot_bandwidth,       # frequency_slot_bandwidth
+                    "discrete",                     # bit_rate_selection
+                    bit_rates,                      # bit_rates
+                    margin,                         # margin
+                    f"examples/jocn_benchmark_2024/results/load_services_{strategy}_def_{mensure[0]}_{mensure[1]}",  # file_name para serviços
+                    False,                          # measure_disruptions
+                    mensure[0],                # measure_disruptions (True/False)
+                    mensure[1],                # measure_disruptions (valor)
+                )
+                env_args.append(sim_args)
 
     # Execução das simulações utilizando multiprocessing se houver mais de uma thread
     print("Iniciando simulações...")

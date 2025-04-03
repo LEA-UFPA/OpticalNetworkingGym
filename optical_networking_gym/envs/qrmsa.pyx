@@ -191,6 +191,8 @@ cdef class QRMSAEnv:
     cdef public int max_modulation_idx
     cdef public int modulations_to_consider
     cdef int spectrum_efficiency_metric
+    cdef bint defragmentation
+    cdef int n_defrag_services
 
     topology: cython.declare(nx.Graph, visibility="readonly")
     bit_rate_selection: cython.declare(Literal["continuous", "discrete"], visibility="readonly")
@@ -223,7 +225,11 @@ cdef class QRMSAEnv:
         file_name: str = "",
         blocks_to_consider: int = 1,
         modulations_to_consider: int = 6,
+        defragmentation: bool = False,
+        n_defrag_services: int = 0,
     ):
+        self.defragmentation = defragmentation
+        self.n_defrag_services = n_defrag_services
         self.rng = random.Random()
         self.blocks_to_consider = blocks_to_consider
         self.mean_service_inter_arrival_time = 0
@@ -537,8 +543,9 @@ cdef class QRMSAEnv:
                         self.current_service.launch_power = self.launch_power
                         self.current_service.blocked_due_to_resources = False
 
-                        osnr, _, _ = calculate_osnr(self, self.current_service)
-
+                        #osnr, _, _ = calculate_osnr(self, self.current_service)
+                        osnr = 10
+                        
                         self.current_service.path = None
                         self.current_service.initial_slot = -1
                         self.current_service.number_slots = 0
@@ -546,7 +553,7 @@ cdef class QRMSAEnv:
                         self.current_service.bandwidth = 0.0
                         self.current_service.launch_power = 0.0
 
-                        if osnr >= modulation.minimum_osnr + self.margin:
+                        if True:#osnr >= modulation.minimum_osnr + self.margin:
                             self.max_modulation_idx = max(len(self.modulations) - idm - 1,
                                                         self.modulations_to_consider - 1)
                             return
@@ -863,8 +870,9 @@ cdef class QRMSAEnv:
                 self.current_service.bandwidth = self.frequency_slot_bandwidth * number_slots
                 self.current_service.launch_power = self.launch_power
 
-                osnr, ase, nli = calculate_osnr(self, self.current_service)
-                if osnr >= osnr_req:
+                #osnr, ase, nli = calculate_osnr(self, self.current_service)
+                osnr,ase, nli = 10,0,0
+                if True: #osnr >= osnr_req:
                     self.current_service.accepted = True
                     self.current_service.OSNR = osnr
                     self.current_service.ASE = ase
@@ -1063,6 +1071,8 @@ cdef class QRMSAEnv:
             time, _, service_to_release = heapq.heappop(self._events)
             if time <= self.current_time:
                 self._release_path(service_to_release)
+                if self.defragmentation:
+                    self.defragment(self.n_defrag_services)
             else:
                 heapq.heappush(self._events, (time, service_to_release.service_id, service_to_release))
                 break 
@@ -1433,6 +1443,99 @@ cdef class QRMSAEnv:
         cdef cnp.ndarray final_indices_np = np.intersect1d(available_indices_np, sufficient_indices_np)[:j]
 
         return initial_indices[final_indices_np], lengths[final_indices_np]
+
+    cpdef defragment(self, int num_services):
+
+        if num_services == 0:
+            num_services = 1000000
+            # print("Nenhum serviço para defragmentar. Saindo.")
+            return
+
+        # print(f"INICIANDO defragmentação para {num_services} serviços.")
+        cdef int moved = 0
+        cdef Service service
+        cdef int number_slots, candidate, i, path_length, link_index, start_slot, end_slot
+        cdef object path, candidates
+        cdef cnp.ndarray available_slots
+        cdef tuple node_list
+
+        cdef list active_services = list(self.topology.graph["running_services"])
+        # print(f"Total de serviços ativos: {len(active_services)}")
+
+        for service in active_services:
+            # print(f"\nProcessando serviço ID {service.service_id} ...")
+            if moved >= num_services:
+                # print(f"Alvo atingido: {num_services} serviços movidos.")
+                break
+
+            path = service.path
+            number_slots = service.number_slots
+            # print(f"Serviço ID {service.service_id}: number_slots = {number_slots}, initial_slot atual = {service.initial_slot}")
+            available_slots = self.get_available_slots(path)
+            candidates = self._get_candidates(available_slots, number_slots, self.num_spectrum_resources)
+            # print(f"Serviço ID {service.service_id}: candidatos encontrados = {candidates}")
+
+            if not candidates:
+                # print(f"Serviço ID {service.service_id}: Nenhum candidato disponível. Pulando.")
+                continue
+
+            candidate = candidates[0]
+            # print(f"Serviço ID {service.service_id}: candidato selecionado = {candidate}")
+            if candidate == service.initial_slot or service.initial_slot < candidate:
+                # print(f"Serviço ID {service.service_id}: Candidato igual ou pior que a alocação atual (initial_slot = {service.initial_slot}). Pulando.")
+                continue
+
+            node_list = path.get_node_list()
+            path_length = len(node_list)
+            # print(f"Serviço ID {service.service_id}: Nó do caminho = {node_list}, path_length = {path_length}")
+
+            # Libera a alocação antiga em cada link do caminho.
+            for i in range(path_length - 1):
+                link_index = self.topology[node_list[i]][node_list[i+1]]["index"]
+                # print(f"Serviço ID {service.service_id}: Liberando alocação no link {node_list[i]}->{node_list[i+1]}, índice = {link_index}, slots {service.initial_slot} até {service.initial_slot + service.number_slots + 1}")
+                self.topology.graph["available_slots"][link_index,
+                    service.initial_slot : service.initial_slot + service.number_slots + 1] = 1
+                self.spectrum_slots_allocation[link_index,
+                    service.initial_slot : service.initial_slot + service.number_slots + 1] = -1
+
+                if service in self.topology[node_list[i]][node_list[i+1]]["running_services"]:
+                    # print(f"Serviço ID {service.service_id}: Removendo do running_services no link {node_list[i]}->{node_list[i+1]}")
+                    self.topology[node_list[i]][node_list[i+1]]["running_services"].remove(service)
+
+            # Nova alocação.
+            start_slot = candidate
+            end_slot = start_slot + number_slots
+            if end_slot < self.num_spectrum_resources:
+                end_slot += 1  # Adiciona faixa de guarda se não estiver no final.
+            elif end_slot > self.num_spectrum_resources:
+                raise ValueError("End slot is greater than the number of spectrum resources.")
+
+            # print(f"Serviço ID {service.service_id}: Nova alocação de slots será de {start_slot} a {end_slot}")
+
+            for i in range(path_length - 1):
+                link_index = self.topology[node_list[i]][node_list[i+1]]["index"]
+                # print(f"Serviço ID {service.service_id}: Definindo alocação no link {node_list[i]}->{node_list[i+1]}, índice = {link_index}, slots {start_slot} até {end_slot}")
+                self.topology.graph["available_slots"][link_index, start_slot:end_slot] = 0
+                self.spectrum_slots_allocation[link_index, start_slot:end_slot] = service.service_id
+                self.topology[node_list[i]][node_list[i+1]]["services"].append(service)
+                self.topology[node_list[i]][node_list[i+1]]["running_services"].append(service)
+
+            # Atualiza atributos do serviço.
+            service.initial_slot = candidate
+            service.center_frequency = self.frequency_start + (
+                self.frequency_slot_bandwidth * candidate
+            ) + (
+                self.frequency_slot_bandwidth * (number_slots / 2.0)
+            )
+            service.bandwidth = self.frequency_slot_bandwidth * number_slots
+
+            # print(f"Serviço ID {service.service_id}: Atualizado -> initial_slot: {service.initial_slot}, center_frequency: {service.center_frequency}, bandwidth: {service.bandwidth}")
+            moved += 1
+            # print(f"Progresso da defragmentação: {moved}/{num_services} serviços movidos.")
+
+        # print(f"Defragmentação finalizada: total de serviços movidos = {moved}")
+        return
+
 
     def close(self):
         return super().close()

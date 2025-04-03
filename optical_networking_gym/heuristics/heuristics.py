@@ -202,99 +202,12 @@ def shortest_available_path_first_fit_best_modulation(
 ) -> Optional[int]:
     return int(np.where(mask == 1)[0][0])
 
-    # """
-    # Seleciona a rota mais curta disponível com a primeira alocação possível e a melhor modulação.
-
-    # Args:
-    #     env (gym.Env): O ambiente potencialmente envolvido em wrappers.
-
-    # Returns:
-    #     Optional[int]: Índice da ação correspondente, ou a ação de rejeição se permitido, ou None.
-    # """
-    # qrmsa_env: QRMSAEnv = get_qrmsa_env(env)  # Descompactar o ambiente
-    # bl_resource = True
-    # bl_osnr = False
-    # # print("Inicializando bl_resource como True e bl_osnr como False")
-
-    # # Itera por cada rota possível entre source e destination
-    # for idp, path in enumerate(qrmsa_env.k_shortest_paths[
-    #     qrmsa_env.current_service.source,
-    #     qrmsa_env.current_service.destination,
-    # ]):
-    #     # print(f"\nIterando sobre o caminho {idp}: {path}")
-    #     available_slots = qrmsa_env.get_available_slots(path)
-    #     # print(f"Slots disponíveis para o caminho {idp}: {available_slots}")
-
-    #     # Executa a RLE para identificar blocos contíguos na lista de slots disponíveis
-    #     initial_indices, values, lengths = rle(available_slots)
-    #     # print(f"RLE result - initial_indices: {initial_indices}, values: {values}, lengths: {lengths}")
-
-    #     # Itera pelas modulações, da melhor para a pior
-    #     for idm, modulation in zip(range(len(qrmsa_env.modulations) - 1, -1, -1),
-    #                                 reversed(qrmsa_env.modulations)):
-    #         # print(f"\nIterando sobre a modulação {idm}: {modulation}")
-    #         # Número de slots requeridos para o serviço com a modulação atual (incluindo eventuais requisitos de guarda)
-    #         number_slots = qrmsa_env.get_number_slots(qrmsa_env.current_service, modulation)
-    #         # print(f"Número de slots requeridos para a modulação {idm}: {number_slots}")
-
-    #         # Filtra os blocos (candidatos) manualmente, gerando TODOS os índices possíveis dentro do bloco
-    #         candidatos = []
-    #         for start, val, length in zip(initial_indices, values, lengths):
-    #             if val == 1:
-    #                 # Se o bloco se estende até o final do espectro, ignora o guard band
-    #                 if start + length == env.num_spectrum_resources:
-    #                     if length >= number_slots:
-    #                         for candidate in range(start, start + length - number_slots + 1):
-    #                             candidatos.append(candidate)
-    #                             # print(f"Adicionando candidato {candidate} (sem guard band - bloco até o final) a partir do bloco que inicia em {start} com comprimento {length}")
-    #                 else:
-    #                     # Caso contrário, exige um slot extra para o guard band
-    #                     if length >= (number_slots + 1):
-    #                         for candidate in range(start, start + length - (number_slots + 1) + 1):
-    #                             candidatos.append(candidate)
-    #                             # print(f"Adicionando candidato {candidate} (guard band incluído) a partir do bloco que inicia em {start} com comprimento {length}")
-
-    #         # print(f"Candidatos encontrados para modulação {idm}: {candidatos}")
-
-    #         if len(candidatos) > 0:
-    #             bl_resource = False
-    #             # print("Atualizando bl_resource para False")
-    #             qrmsa_env.current_service.blocked_due_to_resources = False
-
-    #             # Itera por cada candidato (initial slot) encontrado
-    #             for candidate in candidatos:
-    #                 # print(f"\nTestando candidato com initial_slot {candidate}")
-    #                 # Atualiza os parâmetros do serviço para o candidato atual
-    #                 qrmsa_env.current_service.path = path
-    #                 qrmsa_env.current_service.initial_slot = candidate
-    #                 qrmsa_env.current_service.number_slots = number_slots
-    #                 qrmsa_env.current_service.center_frequency = (
-    #                     qrmsa_env.frequency_start +
-    #                     (qrmsa_env.frequency_slot_bandwidth * candidate) +
-    #                     (qrmsa_env.frequency_slot_bandwidth * (number_slots / 2))
-    #                 )
-    #                 qrmsa_env.current_service.bandwidth = qrmsa_env.frequency_slot_bandwidth * number_slots
-    #                 qrmsa_env.current_service.launch_power = qrmsa_env.launch_power
-    #                 # print(f"Atualizando serviço com path: {path}, initial_slot: {candidate}, number_slots: {number_slots}")
-
-    #                 # Calcula o OSNR para o serviço com o candidato atual
-    #                 osnr, ase, nli = calculate_osnr(qrmsa_env, qrmsa_env.current_service)
-    #                 # print(f"OSNR calculado: {osnr}, ASE: {ase}, NLI: {nli}")
-
-    #                 if osnr >= modulation.minimum_osnr + qrmsa_env.margin:
-    #                     bl_osnr = False
-    #                     # print("OSNR aceitável, atualizando bl_osnr para False")
-    #                     # Converte para o índice de ação com base no caminho, modulação e initial slot selecionados
-    #                     action = get_action_index(qrmsa_env, idp, idm, candidate)
-    #                     # print(f"Ação selecionada: {action}")
-    #                     return action, bl_osnr, bl_resource
-    #                 else:
-    #                     bl_osnr = True
-    #                     # print("OSNR não aceitável para este candidato, continuando para o próximo candidato")
-
-    # # Se nenhum bloco candidato resultar num OSNR aceitável, retorna a ação de rejeição
-    # # print("Nenhum candidato válido encontrado, retornando ação de rejeição")
-    # return qrmsa_env.reject_action, bl_osnr, bl_resource
+def rnd(
+    mask: np.ndarray,
+    # env: Env,
+) -> Optional[int]:
+    valid_actions = np.where(mask == 1)[0]
+    return int(np.random.choice(valid_actions))
 
 
 def shortest_available_path_lowest_spectrum_best_modulation(
