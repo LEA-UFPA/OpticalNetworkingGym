@@ -16,7 +16,7 @@ from optical_networking_gym.topology import Modulation, get_topology
 # ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
-        return np.arange(200, 1000, 100)
+        return np.arange(50, 300, 50)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
@@ -138,11 +138,12 @@ def run_environment(
         file_handler.write(f"# Date: {datetime.now()}\n")
         header = (
             "episode,service_blocking_rate,episode_service_blocking_rate,"
-            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate"
+            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate, episode_service_realocations, episode_defrag_cicles"
         )
         for mf in env.env.modulations:
             header += f",modulation_{mf.spectral_efficiency}"
-        header += ",episode_disrupted_services,episode_time\n"
+        header += ",episode_disrupted_services,episode_time,"
+        header += "mean_gsnr\n"
         file_handler.write(header)
 
         # Execução dos episódios
@@ -163,12 +164,20 @@ def run_environment(
                 f"{ep},{info['service_blocking_rate']},"
                 f"{info['episode_service_blocking_rate']},"
                 f"{info['bit_rate_blocking_rate']},"
-                f"{info['episode_bit_rate_blocking_rate']}"
+                f"{info['episode_bit_rate_blocking_rate']},"
+                f"{info['episode_service_realocations']},"
+                f"{info['episode_defrag_cicles']}"
             )
             for mf in env.env.modulations:
                 row += f",{info.get(f'modulation_{mf.spectral_efficiency}', 0.0)}"
-            row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}\n"
+            row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}"
+            mean_gsnr = 0.0
+            for service in env.env.topology.graph["services"]:
+                mean_gsnr += service.OSNR
+            mean_gsnr /= len(env.env.topology.graph["services"])
+            row += f",{mean_gsnr}\n"
             file_handler.write(row)
+                
 
     print(f"\nFinalizado! Resultados salvos em: {monitor_final_name}")
 
@@ -193,19 +202,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=5,
+        default=3,
         help='Número de episódios a serem simulados (default: 5)'
     )
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=10000,
+        default=1000,
         help='Número de chegadas por episódio (default: 1000)'
     )
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=1,
+        default=10,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -317,7 +326,7 @@ def main():
     env_args = []
     for current_load in loads:
         for strategy in [1, 2]:
-            for mensure in [[False,0], [True, 10], [True, 50], [True, 0]]:
+            for mensure in [[False,0], [True, 10], [True, 0]]:
                 sim_args = (
                     args.num_episodes,              # n_eval_episodes
                     strategy,                       # heuristic_index

@@ -126,6 +126,8 @@ def create_environment():
         file_name="",  # Podemos deixar vazio, pois não estamos logando em cada step
         k_paths=5,     # Mesmo valor do PPO
         modulations_to_consider=2,  # Mesmo valor do PPO
+        defragmentation=True,
+        n_defrag_services=10,
     )
     return topology, env_args
 
@@ -149,7 +151,7 @@ def run_first_fit_environment(
     :param csv_output: caminho do CSV de saída.
     """
     # Seleciona a função da heurística (first-fit)
-    fn_heuristic = heuristic_from_mask#shortest_available_path_first_fit_best_modulation
+    fn_heuristic = shortest_available_path_first_fit_best_modulation
     # fn_heuristic = best_modulation_load_balancing
     
     # Cria instância do ambiente
@@ -198,7 +200,7 @@ def run_first_fit_environment(
 
             while not done:
                 # print(f"current service: {env.unwrapped.env.current_service}")
-                action, bl_osnr, bl_resource = fn_heuristic(env.unwrapped.env, info["mask"]), 0 ,0 
+                action, bl_osnr, bl_resource = fn_heuristic(info["mask"]), 0 ,0 
                 if bl_osnr:
                     osnr_count += 1
                 if bl_resource:
