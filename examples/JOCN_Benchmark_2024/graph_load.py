@@ -16,7 +16,7 @@ from optical_networking_gym.topology import Modulation, get_topology
 # ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
-        return np.arange(50, 300, 50)
+        return np.arange(100, 501, 100)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
@@ -130,7 +130,7 @@ def run_environment(
         monitor_file_name, 
         topology.name, 
         str(env.env.launch_power_dbm), 
-        str(env.env.load) + ".csv"
+        str(env.env.load) + "_nw_cnr_nobel-eu.csv"
     ])
 
     # Preparação do arquivo CSV
@@ -187,7 +187,7 @@ def run_environment(
 logging.getLogger("rmsaenv").setLevel(logging.INFO)
 np.set_printoptions(linewidth=np.inf)
 
-seed = 20
+seed = 50
 random.seed(seed)
 np.random.seed(seed)
 
@@ -196,13 +196,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-t', '--topology_file',
         type=str,
-        default='nobel-eu.xml',
+        default='nobel-eu.xml',#'nobel-eu.xml',
         help='Arquivo de topologia a ser utilizado (default: nsfnet_chen.txt)'
     )
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=3,
+        default=25,
         help='Número de episódios a serem simulados (default: 5)'
     )
     parser.add_argument(
@@ -214,7 +214,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=10,
+        default=15,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -290,7 +290,7 @@ def main():
     default_noise_figure_db = 4.5
 
     # Caminho da topologia
-    topology_path = os.path.join("examples", "topologies", args.topology_file)
+    topology_path = "/home/talles/projects/optical-networking-gym/examples//topologies/nobel-eu.xml"
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
 
@@ -313,20 +313,16 @@ def main():
     bit_rates = (10, 40, 100, 400)
     margin = 0
 
-    # Valor fixo de launch power (mantido inalterado)
     launch_power = 1.0
 
-    # Obtenção do vetor de cargas com base no arquivo de topologia
     loads = get_loads(args.topology_file)
 
-    # Definição das estratégias (heurísticas)
     strategies = list(range(1, 5))
 
-    # Preparação dos argumentos de simulação para cada combinação de carga e estratégia
     env_args = []
     for current_load in loads:
-        for strategy in [1, 2]:
-            for mensure in [[False,0], [True, 10], [True, 0]]:
+        for strategy in [1]:
+            for mensure in [[False,0], [True, 0]]:
                 sim_args = (
                     args.num_episodes,              # n_eval_episodes
                     strategy,                       # heuristic_index
