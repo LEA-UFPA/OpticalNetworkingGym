@@ -8,6 +8,10 @@ import gymnasium as gym
 from datetime import datetime
 from typing import Tuple
 
+import cProfile
+import pstats
+
+
 # Importações específicas do optical-networking-gym
 import optical_networking_gym.wrappers.qrmsa_gym
 from optical_networking_gym.heuristics.heuristics import (
@@ -15,7 +19,8 @@ from optical_networking_gym.heuristics.heuristics import (
     shortest_available_path_lowest_spectrum_best_modulation,
     best_modulation_load_balancing,
     load_balancing_best_modulation,
-    heuristic_from_mask
+    heuristic_from_mask,
+    heuristic_lowest_fragmentation
 )
 from optical_networking_gym.topology import Modulation, get_topology
 
@@ -112,8 +117,8 @@ def create_environment():
         topology=topology,
         seed=seed,
         allow_rejection=True,
-        load=210,                    # Mesmo load do PPO
-        episode_length=100,         # Mesmo episode_length do PPO
+        load=250,                    # Mesmo load do PPO
+        episode_length=1000,         # Mesmo episode_length do PPO
         num_spectrum_resources=320,  # Mesmo número de slots do PPO
         launch_power_dbm=0,          # Mesmo launch power do PPO
         frequency_slot_bandwidth=12.5e9,
@@ -126,8 +131,8 @@ def create_environment():
         file_name="",  # Podemos deixar vazio, pois não estamos logando em cada step
         k_paths=5,     # Mesmo valor do PPO
         modulations_to_consider=2,  # Mesmo valor do PPO
-        defragmentation=True,
-        n_defrag_services=10,
+        defragmentation=False,
+        n_defrag_services=0,
     )
     return topology, env_args
 
@@ -251,7 +256,7 @@ def run_first_fit_environment(
 def main():
     topology, env_args = create_environment()
 
-    n_eval_episodes = 2
+    n_eval_episodes = 1
 
     # (C) Executamos a heurística First-Fit e salvamos em CSV
     time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -263,4 +268,15 @@ def main():
     )
 
 if __name__ == "__main__":
+    # # Executa o profiler
+    # pr = cProfile.Profile()
+    # pr.enable()
+
     main()
+
+    # # Desabilita o profiler e salva os resultados
+    # pr.disable()
+    # stats = pstats.Stats(pr)
+    # stats.sort_stats("cumulative")
+    # stats.print_stats()
+    # stats.dump_stats("profiler_results.prof")

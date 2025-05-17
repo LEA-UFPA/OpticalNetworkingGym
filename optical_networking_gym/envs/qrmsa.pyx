@@ -195,6 +195,7 @@ cdef class QRMSAEnv:
     cdef int n_defrag_services
     cdef int episode_defrag_cicles
     cdef int episode_service_realocations
+    cdef bint gen_observation
 
     topology: cython.declare(nx.Graph, visibility="readonly")
     bit_rate_selection: cython.declare(Literal["continuous", "discrete"], visibility="readonly")
@@ -229,7 +230,9 @@ cdef class QRMSAEnv:
         modulations_to_consider: int = 6,
         defragmentation: bool = False,
         n_defrag_services: int = 0,
+        gen_observation: bool = True,
     ):
+        self.gen_observation = gen_observation
         self.defragmentation = defragmentation
         self.n_defrag_services = n_defrag_services
         self.rng = random.Random()
@@ -565,6 +568,11 @@ cdef class QRMSAEnv:
         self.max_modulation_idx = self.modulations_to_consider - 1
 
     def observation(self):
+        if not self.gen_observation:
+            obs    = np.zeros((self.observation_space.shape[0],), dtype=np.float32)
+            action_mask = np.zeros((self.action_space.n,),           dtype=np.uint8)
+            return obs, {'mask': action_mask}
+            
         def compute_modulation_features(available_slots, num_slots_required, route_links, modulation):
             valid_starts = self._get_candidates(available_slots, num_slots_required, self.num_spectrum_resources)
             candidate_count = len(valid_starts)
@@ -852,7 +860,7 @@ cdef class QRMSAEnv:
             initial_slot = decoded[2]
             modulation = self.modulations[modulation_idx]
             osnr_req = modulation.minimum_osnr + self.margin
-
+            print(f"Route: {route}, Modulation: {modulation}, Initial Slot: {initial_slot}")
             path = self.k_shortest_paths[
                 self.current_service.source,
                 self.current_service.destination
@@ -862,7 +870,6 @@ cdef class QRMSAEnv:
                 service=self.current_service,
                 modulation=modulation
             )
-
             if self.is_path_free(path=path, initial_slot=initial_slot, number_slots=number_slots):
                 self.current_service.path = path
                 self.current_service.initial_slot = initial_slot
@@ -892,10 +899,18 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
+                    raise ValueError(
+                        f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
+                        f"with modulation {modulation}, and osnr_req {osnr_req}."
+                    )
                     self.current_service.accepted = False
                     self.current_service.blocked_due_to_osnr = True
                     self.bl_osnr += 1
             else:
+                raise ValueError(
+                    f"Path {path} is not free for service {self.current_service.service_id} "
+                    f"with initial slot {initial_slot} and number of slots {number_slots}."
+                )
                 self.current_service.accepted = False
                 self.current_service.blocked_due_to_resources = True
                 self.bl_resource += 1
@@ -1435,6 +1450,7 @@ cdef class QRMSAEnv:
                 product_view[j] *= slots_view[i, j]
 
         return product
+    
 
     cpdef tuple get_available_blocks(self, int path, int slots, j):
         cdef cnp.ndarray available_slots = self.get_available_slots(
@@ -1452,6 +1468,18 @@ cdef class QRMSAEnv:
         cdef cnp.ndarray final_indices_np = np.intersect1d(available_indices_np, sufficient_indices_np)[:j]
 
         return initial_indices[final_indices_np], lengths[final_indices_np]
+
+
+    cpdef list _get_spectrum_slots(self, int path):
+        spectrum_route = []
+        for link in self.k_shortest_paths[
+            self.current_service.source, 
+            self.current_service.destination
+        ][path].links:
+            link_index = self.topology[link.node1][link.node2]["index"]
+            spectrum_route.append(self.topology.graph["available_slots"][link_index, :])
+
+        return spectrum_route
 
 
     cpdef defragment(self, int num_services):

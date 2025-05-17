@@ -1,7 +1,8 @@
+import math
 from typing import Optional
 import numpy as np
 from optical_networking_gym.topology import Modulation, Path
-from optical_networking_gym.utils import rle
+from optical_networking_gym.utils import rle, link_shannon_entropy_, fragmentation_route_cuts, fragmentation_route_rss
 from optical_networking_gym.core.osnr import calculate_osnr
 from optical_networking_gym.envs.qrmsa import QRMSAEnv
 from gymnasium import Env
@@ -196,15 +197,207 @@ def heuristic_from_mask(env: Env, mask: np.ndarray) -> int:
 
 
 
+def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int:
+    blocked_due_to_resources, blocked_due_to_osnr = False, False
+    sim_env = get_qrmsa_env(env)
+    source = sim_env.current_service.source
+    destination = sim_env.current_service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+    for path_idx, path in enumerate(k_paths):
+        for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[modulation_idx]
+
+            required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+            if required_slots <= 0:
+                continue 
+            available_slots = sim_env.get_available_slots(path)
+            valid_starts = sim_env._get_candidates(available_slots, required_slots, sim_env.num_spectrum_resources)
+            
+            if not valid_starts:
+                blocked_due_to_resources = True
+                continue 
+            candidate_start = valid_starts[0]
+            service = sim_env.current_service
+            service.path = path
+            service.initial_slot = candidate_start
+            service.number_slots = required_slots
+            service.current_modulation = modulation
+            service.center_frequency = (
+                        sim_env.frequency_start +
+                        (sim_env.frequency_slot_bandwidth * candidate_start) +
+                        (sim_env.frequency_slot_bandwidth * (required_slots / 2)))
+            
+            service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+            service.launch_power = sim_env.launch_power
+            
+            osnr, _, _ = calculate_osnr(sim_env, service)
+            threshold = modulation.minimum_osnr + sim_env.margin
+            if osnr >= threshold:
+                action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
+                print(f"Escolhendo ação {action_index} com OSNR {osnr:.2f} e modulação {modulation.name}, k_path {path_idx}, slot {candidate_start}")
+                return action_index, False, False 
+            else:
+                blocked_due_to_osnr = True
+                if blocked_due_to_resources:
+                    blocked_due_to_resources = False
+    
+    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
+
+
+def heuristic_highest_snr(env: Env) -> int:
+    best_osnr = -np.inf
+    best_action = None
+    any_blocked_resources = False
+    any_blocked_osnr = False
+
+    sim_env = get_qrmsa_env(env)
+    source = sim_env.current_service.source
+    destination = sim_env.current_service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+
+    for path_idx, path in enumerate(k_paths):
+        for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[modulation_idx]
+
+            required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+            if required_slots <= 0:
+                continue
+
+            available_slots = sim_env.get_available_slots(path)
+            valid_starts = sim_env._get_candidates(available_slots, required_slots, sim_env.num_spectrum_resources)
+
+            if not valid_starts:
+                any_blocked_resources = True
+                continue
+
+            for candidate_start in valid_starts:
+                service = sim_env.current_service
+                service.path = path
+                service.initial_slot = candidate_start
+                service.number_slots = required_slots
+                service.current_modulation = modulation
+                service.center_frequency = (
+                    sim_env.frequency_start +
+                    (sim_env.frequency_slot_bandwidth * candidate_start) +
+                    (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+                )
+                service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+                service.launch_power = sim_env.launch_power
+
+                osnr, _, _ = calculate_osnr(sim_env, service)
+                threshold = modulation.minimum_osnr + sim_env.margin
+
+                if osnr >= threshold:
+                    if osnr > best_osnr or (osnr == best_osnr and best_action is None):
+                        action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
+                        best_osnr = osnr
+                        best_action = action_index
+                else:
+                    any_blocked_osnr = True
+
+    if best_action is not None:
+        return best_action, False, False 
+    else:
+        if any_blocked_osnr:
+            any_blocked_resources = False
+        return env.action_space.n - 1, any_blocked_resources, any_blocked_osnr
+
+def heuristic_lowest_fragmentation(env: Env) -> tuple[int, bool, bool]:
+    sim_env = get_qrmsa_env(env)
+    service = sim_env.current_service
+    source, destination = service.source, service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+
+    best_score = math.inf
+    best_action = None
+    any_blocked_resources = False
+    any_blocked_osnr       = False
+
+    for path_idx, path in enumerate(k_paths):
+        raw = sim_env._get_spectrum_slots(path_idx)
+
+        if isinstance(raw, list):
+            base_spectra = np.stack(raw, axis=0)
+        else:
+            arr = np.array(raw)
+            if arr.ndim == 1:
+                base_spectra = arr[None, :]    # (1, n_slots)
+            elif arr.ndim == 2:
+                base_spectra = arr
+            else:
+                raise ValueError(f"Formato inesperado em _get_spectrum_slots: ndim={arr.ndim}")
+
+        for mod_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[mod_idx]
+            req_slots  = sim_env.get_number_slots(service, modulation)+1
+            if req_slots <= 0:
+                continue
+
+            available = sim_env.get_available_slots(path)
+            candidates = sim_env._get_candidates(
+                available, req_slots, sim_env.num_spectrum_resources
+            )
+            if not candidates:
+                any_blocked_resources = True
+                continue
+
+            for start in candidates:
+                # 3) simula a alocação: clone e pinta o bloco como 1=ocupado
+                tmp = base_spectra.copy()
+                tmp[:, start:start+req_slots] = 1
+
+                # 4) calcula métricas de fragmentação
+                # 4a) entropia média
+                entropies = [ link_shannon_entropy_(row.tolist()) for row in tmp ]
+                se   = sum(entropies) / len(entropies) if entropies else 0.0
+                # 4b) cuts
+                cuts = fragmentation_route_cuts([row.tolist() for row in tmp])
+                # 4c) rss
+                rss  = fragmentation_route_rss([row.tolist() for row in tmp])
+
+                score = 0.33 * se + 0.33 * cuts + 0.34 * rss
+
+                # 5) verifica OSNR
+                service.path             = path
+                service.initial_slot     = start
+                service.number_slots     = req_slots
+                service.current_modulation = modulation
+                service.center_frequency = (
+                    sim_env.frequency_start
+                    + sim_env.frequency_slot_bandwidth * start
+                    + sim_env.frequency_slot_bandwidth * (req_slots / 2)
+                )
+                service.bandwidth    = sim_env.frequency_slot_bandwidth * req_slots
+                service.launch_power = sim_env.launch_power
+
+                osnr, _, _ = calculate_osnr(sim_env, service)
+                if osnr < modulation.minimum_osnr + sim_env.margin:
+                    any_blocked_osnr = True
+                    continue
+
+                # 6) escolhe o candidato de menor fragmentação
+                if score < best_score:
+                    best_score  = score
+                    best_action = get_action_index(sim_env, path_idx, mod_idx, start)
+
+    # 7) retorna conforme convenção
+    if best_action is not None:
+        return best_action, False, False
+    else:
+        if any_blocked_osnr:
+            any_blocked_resources = False
+        return env.action_space.n - 1, any_blocked_resources, any_blocked_osnr
+
+
+
+
 def shortest_available_path_first_fit_best_modulation(
     mask: np.ndarray,
-    # env: Env,
 ) -> Optional[int]:
     return int(np.where(mask == 1)[0][0])
 
 def rnd(
     mask: np.ndarray,
-    # env: Env,
 ) -> Optional[int]:
     valid_actions = np.where(mask == 1)[0]
     return int(np.random.choice(valid_actions))
@@ -222,7 +415,7 @@ def shortest_available_path_lowest_spectrum_best_modulation(
     Returns:
         Optional[int]: Índice da ação correspondente, ou a ação de rejeição se permitido, ou None.
     """
-    qrmsa_env: QRMSAEnv = get_qrmsa_env(env)  # Descompactar o ambiente
+    qrmsa_env: QRMSAEnv = get_qrmsa_env(env) 
 
     for idp, path in enumerate(qrmsa_env.k_shortest_paths[
         qrmsa_env.current_service.source,
@@ -233,7 +426,7 @@ def shortest_available_path_lowest_spectrum_best_modulation(
             range(len(qrmsa_env.modulations) - 1, -1, -1),
             reversed(qrmsa_env.modulations)
         ):
-            number_slots = qrmsa_env.get_number_slots(qrmsa_env.current_service, modulation) + 2  # +2 para guard band
+            number_slots = qrmsa_env.get_number_slots(qrmsa_env.current_service, modulation) + 2 
 
             initial_indices, values, lengths = rle(available_slots)
             sufficient_indices = np.where(lengths >= number_slots)

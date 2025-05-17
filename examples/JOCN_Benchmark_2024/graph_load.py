@@ -16,12 +16,14 @@ from optical_networking_gym.topology import Modulation, get_topology
 # ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
-        return np.arange(50, 300, 50)
+        return np.arange(100, 401, 100)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
         return np.arange(100, 601, 50)
     elif topology_name == "nsfnet_chen.txt":
+        return np.arange(100, 601, 50)
+    elif topology_name == "ring_4.txt":
         return np.arange(100, 601, 50)
     else:
         raise ValueError(f"Unknown topology name: {topology_name}")
@@ -51,6 +53,7 @@ def run_environment(
     measure_disruptions,
     defragmentation,
     n_defrag_services,
+    gen_observation,
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
@@ -81,6 +84,9 @@ def run_environment(
         best_modulation_load_balancing,
         load_balancing_best_modulation,
         rnd,
+        heuristic_shortest_available_path_first_fit_best_modulation,
+        heuristic_highest_snr,
+        heuristic_lowest_fragmentation,
     )
 
     # Configurações do ambiente
@@ -101,18 +107,19 @@ def run_environment(
         file_name=file_name,
         measure_disruptions=measure_disruptions,
         k_paths=5, 
-        modulations_to_consider=2,
+        modulations_to_consider=6,
         defragmentation=defragmentation,
-        n_defrag_services=n_defrag_services, 
+        n_defrag_services=n_defrag_services,
+        gen_observation=gen_observation,
     )
 
     # Seleção da heurística baseada no índice
     if heuristic == 1:
-        fn_heuristic = shortest_available_path_first_fit_best_modulation
+        fn_heuristic = heuristic_shortest_available_path_first_fit_best_modulation
     elif heuristic == 2:
-        fn_heuristic = rnd#shortest_available_path_lowest_spectrum_best_modulation
+        fn_heuristic = heuristic_highest_snr
     elif heuristic == 3:
-        fn_heuristic = best_modulation_load_balancing
+        fn_heuristic = heuristic_lowest_fragmentation
     elif heuristic == 4:
         fn_heuristic = load_balancing_best_modulation
     else:
@@ -152,7 +159,7 @@ def run_environment(
             done = False
             start_time = time.time()
             while not done:
-                action = fn_heuristic(info["mask"])
+                action,_,_ = fn_heuristic(env)
                 _, _, done, _, info = env.step(action)
             end_time = time.time()
             ep_time = end_time - start_time
@@ -202,7 +209,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=3,
+        default=5,
         help='Número de episódios a serem simulados (default: 5)'
     )
     parser.add_argument(
@@ -214,7 +221,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=10,
+        default=1,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -310,7 +317,7 @@ def main():
     bandwidth = 4e12
     frequency_start = 3e8 / 1565e-9
     frequency_slot_bandwidth = 12.5e9
-    bit_rates = (10, 40, 100, 400)
+    bit_rates = (10, 40, 100, 400, 1000)
     margin = 0
 
     # Valor fixo de launch power (mantido inalterado)
@@ -325,12 +332,12 @@ def main():
     # Preparação dos argumentos de simulação para cada combinação de carga e estratégia
     env_args = []
     for current_load in loads:
-        for strategy in [1, 2]:
-            for mensure in [[False,0], [True, 10], [True, 0]]:
+        for strategy in [1,2,3]:
+            for mensure in [False,0]:
                 sim_args = (
                     args.num_episodes,              # n_eval_episodes
                     strategy,                       # heuristic_index
-                    f"{args.monitor_file_name}_{strategy}_def_{mensure[0]}_{mensure[1]}",  # monitor_file_name base
+                    f"{args.monitor_file_name}_{strategy}",  # monitor_file_name base
                     topology,                       # topology
                     seed,                           # seed
                     True,                           # allow_rejection
@@ -344,10 +351,11 @@ def main():
                     "discrete",                     # bit_rate_selection
                     bit_rates,                      # bit_rates
                     margin,                         # margin
-                    f"examples/jocn_benchmark_2024/results/load_services_{strategy}_def_{mensure[0]}_{mensure[1]}",  # file_name para serviços
+                    f"examples/jocn_benchmark_2024/results/load_services_{strategy}",  # file_name para serviços
                     False,                          # measure_disruptions
-                    mensure[0],                # measure_disruptions (True/False)
-                    mensure[1],                # measure_disruptions (valor)
+                    False,                # measure_disruptions (True/False)
+                    0,                # measure_disruptions (valor)
+                    False,                          # run observation
                 )
                 env_args.append(sim_args)
 
