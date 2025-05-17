@@ -234,7 +234,6 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             threshold = modulation.minimum_osnr + sim_env.margin
             if osnr >= threshold:
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
-                print(f"Escolhendo ação {action_index} com OSNR {osnr:.2f} e modulação {modulation.name}, k_path {path_idx}, slot {candidate_start}")
                 return action_index, False, False 
             else:
                 blocked_due_to_osnr = True

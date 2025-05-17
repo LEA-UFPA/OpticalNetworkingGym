@@ -860,7 +860,6 @@ cdef class QRMSAEnv:
             initial_slot = decoded[2]
             modulation = self.modulations[modulation_idx]
             osnr_req = modulation.minimum_osnr + self.margin
-            print(f"Route: {route}, Modulation: {modulation}, Initial Slot: {initial_slot}")
             path = self.k_shortest_paths[
                 self.current_service.source,
                 self.current_service.destination
