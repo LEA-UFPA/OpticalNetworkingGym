@@ -7,6 +7,7 @@ from typing import Tuple
 import numpy as np
 import time
 from datetime import datetime
+from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
 
 from optical_networking_gym.topology import Modulation, get_topology
 
@@ -32,6 +33,9 @@ def run_environment(
     margin,
     file_name,
     measure_disruptions,
+    defragmentation,
+    n_defrag_services,
+    gen_observation,
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
@@ -61,13 +65,17 @@ def run_environment(
         shortest_available_path_lowest_spectrum_best_modulation,
         best_modulation_load_balancing,
         load_balancing_best_modulation,
+        rnd,
+        heuristic_shortest_available_path_first_fit_best_modulation,
+        heuristic_highest_snr,
+        heuristic_lowest_fragmentation,
     )
 
     # Configurações do ambiente
     env_args = dict(
         topology=topology,
         seed=seed,
-        allow_rejection=True,
+        allow_rejection=allow_rejection,
         load=load,
         episode_length=episode_length,
         num_spectrum_resources=num_spectrum_resources,
@@ -81,13 +89,16 @@ def run_environment(
         file_name=file_name,
         measure_disruptions=measure_disruptions,
         k_paths=5, 
-        modulations_to_consider=2, 
+        modulations_to_consider=6,
+        defragmentation=defragmentation,
+        n_defrag_services=n_defrag_services,
+        gen_observation=gen_observation,
     )
 
     # Seleção da heurística baseada no índice
     fn_heuristic = None
     if heuristic == 1:
-        fn_heuristic = shortest_available_path_first_fit_best_modulation
+        fn_heuristic = heuristic_shortest_available_path_first_fit_best_modulation
     elif heuristic == 2:
         fn_heuristic = shortest_available_path_lowest_spectrum_best_modulation
     elif heuristic == 3:
@@ -136,7 +147,7 @@ def run_environment(
             start_time = time.time()
 
             while not done:
-                action = fn_heuristic(info["mask"])#env.env)
+                action,_,_  = fn_heuristic(env)
                 _, _, done, _, info = env.step(action)
             
             end_time = time.time()
@@ -183,7 +194,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=5,
+        default=15,
         help='Number of episodes to be simulated (default: 1000)'
     )
 
@@ -197,14 +208,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-l', '--load',
         type=int,
-        default=210,
+        default=400,
         help='Load to be used in the simulation (default: 210)'
     )
 
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default= 9,
+        default= 10,
         help='Number of threads to be used for running simulations (default: 2)'
     )
 
@@ -290,8 +301,8 @@ def main():
 
     # Carregamento da topologia
     topology_path = os.path.join(
-        "examples", "topologies", args.topology_file
-    )
+         "examples", "topologies", args.topology_file
+     )
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Topology file '{topology_path}' not found.")
 
@@ -336,7 +347,10 @@ def main():
             bit_rates,                     # bit_rates
             0,                             # margin
             "examples/jocn_benchmark_2024/results/lp_services_1",  # file_name
-            True,                          # measure_disruptions
+            False,                          # measure_disruptions
+            False,
+            0,                             # n_defrag_services
+            False,                         # defragmentation
         )
         env_args.append(sim_args)
 

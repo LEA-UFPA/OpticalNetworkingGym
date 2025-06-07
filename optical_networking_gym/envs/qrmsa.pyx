@@ -398,7 +398,7 @@ cdef class QRMSAEnv:
             self.file_stats = open(final_name, "wt", encoding="UTF-8")
 
             self.file_stats.write("# Service stats file from simulator\n")
-            self.file_stats.write("id,source,destination,bit_rate,path_k,path_length,modulation,min_osnr,osnr,ase,nli,disrupted_services\n")
+            self.file_stats.write("id,source,destination,bit_rate,path_k,path_length,modulation,min_osnr,osnr,ase,nli,disrupted_services,active_services\n")
         else:
             self.file_stats = None
 
@@ -952,7 +952,7 @@ cdef class QRMSAEnv:
                 self.current_service.bit_rate,
             )
             if self.current_service.accepted:
-                line += "{},{},{},{},{},{},{},{}".format(
+                line += "{},{},{},{},{},{},{},{},{}".format(
                     self.current_service.path.k,
                     self.current_service.path.length,
                     self.current_service.current_modulation.spectral_efficiency,
@@ -961,9 +961,10 @@ cdef class QRMSAEnv:
                     self.current_service.ASE,
                     self.current_service.NLI,
                     disrupted_services,
+                    len(self.topology.graph["running_services"]),
                 )
             else:
-                line += "-1,-1,-1,-1,-1,-1,-1,-1"
+                line += "-1,-1,-1,-1,-1,-1,-1,-1,-1"
             line += "\n"
             self.file_stats.write(line)
             self.file_stats.flush()
