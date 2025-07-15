@@ -582,3 +582,97 @@ def load_balancing_best_modulation(
         return solution, False, False
 
     return qrmsa_env.reject_action, False, False  # ou uma ação padrão específica
+
+
+def _get_largest_contiguous_block(available_slots: np.ndarray) -> int:
+    """Função auxiliar para encontrar o maior bloco contíguo de slots livres."""
+    if not np.any(available_slots):
+        return 0
+    
+    initial_indices, values, lengths = rle(available_slots)
+    
+    max_len = 0
+    for i in range(len(values)):
+        if values[i] == 1 and lengths[i] > max_len:
+            max_len = lengths[i]
+            
+    return max_len
+
+import copy
+
+def heuristic_mscl_sequential_simplified(env: Env) -> tuple[int, bool, bool]:
+    """
+    Implementa a heurística MSCL Sequencial de forma otimizada para testes.
+
+    A heurística itera pelas rotas em sequência. Para a primeira rota que tiver
+    recursos, ela encontra a melhor alocação (baseada em fragmentação mínima)
+    APENAS NESSA ROTA e retorna a ação imediatamente.
+    """
+    sim_env = get_qrmsa_env(env)
+    current_service = sim_env.current_service
+
+    any_blocked_resources = False
+    any_blocked_osnr = False
+
+    # Itera pelas rotas candidatas em sequência
+    for path_idx, path in enumerate(sim_env.k_shortest_paths[current_service.source, current_service.destination]):
+
+        best_score_for_this_path = -1
+        best_action_for_this_path = None
+
+        # Para a rota atual, encontra a melhor combinação de modulação e slot
+        for mod_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[mod_idx]
+            required_slots = sim_env.get_number_slots(current_service, modulation)
+
+            if required_slots <= 0:
+                continue
+
+            available_slots = sim_env.get_available_slots(path)
+            candidate_starts = sim_env._get_candidates(available_slots, required_slots, sim_env.num_spectrum_resources)
+
+            if not candidate_starts:
+                any_blocked_resources = True
+                continue
+
+            # Para manter a robustez, usamos o primeiro slot candidato (First-Fit)
+            start_slot = candidate_starts[0]
+
+            # Verifica o OSNR
+            service_copy = copy.deepcopy(current_service)
+            service_copy.path = path
+            service_copy.initial_slot = start_slot
+            service_copy.number_slots = required_slots
+            service_copy.current_modulation = modulation
+            service_copy.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+            service_copy.launch_power = sim_env.launch_power
+            service_copy.center_frequency = (
+                sim_env.frequency_start +
+                (sim_env.frequency_slot_bandwidth * start_slot) +
+                (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+            )
+
+            osnr, _, _ = calculate_osnr(sim_env, service_copy)
+
+            if osnr >= modulation.minimum_osnr + sim_env.margin:
+                # Calcula a pontuação de fragmentação para esta opção válida
+                temp_slots = available_slots.copy()
+                temp_slots[start_slot : start_slot + required_slots] = 0
+                current_score = _get_largest_contiguous_block(temp_slots)
+
+                # Se esta for a melhor opção encontrada ATÉ AGORA PARA ESTA ROTA
+                if current_score > best_score_for_this_path:
+                    best_score_for_this_path = current_score
+                    best_action_for_this_path = get_action_index(sim_env, path_idx, mod_idx, start_slot)
+            else:
+                any_blocked_osnr = True
+
+        # FIM DO LAÇO DE MODULAÇÕES
+        # Se uma ação válida foi encontrada para esta rota, retorna-a imediatamente.
+        if best_action_for_this_path is not None:
+            return best_action_for_this_path, False, False
+
+    # Se o laço terminar sem nenhuma solução encontrada em nenhuma rota
+    if any_blocked_osnr and not any_blocked_resources:
+        any_blocked_resources = False
+    return sim_env.action_space.n - 1, any_blocked_resources, any_blocked_osnr

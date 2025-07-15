@@ -69,6 +69,7 @@ def run_environment(
         heuristic_shortest_available_path_first_fit_best_modulation,
         heuristic_highest_snr,
         heuristic_lowest_fragmentation,
+        heuristic_mscl_sequential_simplified
     )
 
     # Configurações do ambiente
@@ -98,7 +99,7 @@ def run_environment(
     # Seleção da heurística baseada no índice
     fn_heuristic = 4
     if heuristic == 1:
-        fn_heuristic = heuristic_shortest_available_path_first_fit_best_modulation
+        fn_heuristic = heuristic_mscl_sequential_simplified#heuristic_shortest_available_path_first_fit_best_modulation
     elif heuristic == 2:
         fn_heuristic = shortest_available_path_lowest_spectrum_best_modulation
     elif heuristic == 3:
@@ -215,7 +216,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default= 1,
+        default= 10,
         help='Number of threads to be used for running simulations (default: 2)'
     )
 
@@ -300,9 +301,9 @@ def main():
     default_noise_figure_db = 4.5
 
     # Carregamento da topologia
-    topology_path =  r'examples\topologies\germany50.xml'#os.path.join(
-    #      "examples", "topologies", args.topology_file
-    #  )
+    topology_path = os.path.join(
+         "examples", "topologies", args.topology_file
+     )
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Topology file '{topology_path}' not found.")
 
