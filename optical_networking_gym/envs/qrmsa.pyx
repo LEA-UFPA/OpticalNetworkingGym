@@ -26,14 +26,90 @@ from scipy.signal import convolve
 if typing.TYPE_CHECKING:
     from optical_networking_gym.topology import Link, Span, Modulation, Path
 
+cdef class Band:
+    """Classe para representar uma banda de frequência no espectro óptico"""
+    cdef public str name
+    cdef public double start_thz
+    cdef public int num_slots
+    cdef public double noise_figure_db
+    cdef public double attenuation_db_km
+    cdef public double slot_bw_hz
+    
+    # Atributos derivados
+    cdef public double f_start_hz
+    cdef public double f_end_hz
+    cdef public int slot_start
+    cdef public int slot_end
+    
+    def __init__(self, str name, double start_thz, int num_slots, 
+                 double noise_figure_db, double attenuation_db_km, 
+                 double slot_bw_hz = 12.5e9):
+        # Validações
+        if num_slots <= 0:
+            raise ValueError(f"num_slots must be > 0, got {num_slots}")
+        
+        self.name = name
+        self.start_thz = start_thz
+        self.num_slots = num_slots
+        self.noise_figure_db = noise_figure_db
+        self.attenuation_db_km = attenuation_db_km
+        self.slot_bw_hz = slot_bw_hz
+        
+        # Calcular atributos derivados
+        self.f_start_hz = start_thz * 1e12
+        self.f_end_hz = self.f_start_hz + self.slot_bw_hz * num_slots
+        
+        # Offsets serão definidos externamente via set_slot_offset
+        self.slot_start = -1
+        self.slot_end = -1
+    
+    cpdef void set_slot_offset(self, int offset):
+        """Define o offset de slots na fibra (índices globais)"""
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        
+        self.slot_start = offset
+        self.slot_end = offset + self.num_slots
+    
+    cpdef bint contains_slot_range(self, int global_start, int length):
+        """Verifica se um bloco de slots está totalmente dentro desta banda"""
+        if self.slot_start < 0 or self.slot_end < 0:
+            raise ValueError("Band slot offsets not set. Call set_slot_offset first.")
+        
+        cdef int global_end = global_start + length
+        return global_start >= self.slot_start and global_end <= self.slot_end
+    
+    cpdef int global_to_local(self, int global_slot):
+        """Converte índice global para local desta banda"""
+        if self.slot_start < 0:
+            raise ValueError("Band slot offsets not set. Call set_slot_offset first.")
+        
+        return global_slot - self.slot_start
+    
+    cpdef double center_frequency_hz_from_global(self, int global_start, int length):
+        """Calcula frequência central de um bloco de slots (índices globais)"""
+        if not self.contains_slot_range(global_start, length):
+            raise ValueError(f"Slot range [{global_start}, {global_start + length}) not within band")
+        
+        cdef int local_start = self.global_to_local(global_start)
+        cdef double center_slot = local_start + length / 2.0
+        cdef double center_freq = self.f_start_hz + center_slot * self.slot_bw_hz
+        
+        return center_freq
+    
+    def __repr__(self):
+        return (f"Band(name='{self.name}', start_thz={self.start_thz}, "
+                f"num_slots={self.num_slots}, slot_range=[{self.slot_start}, {self.slot_end}), "
+                f"noise_figure_db={self.noise_figure_db}, attenuation_db_km={self.attenuation_db_km})")
+
 cdef class FastPathOps:
     """Operações vetorizadas rápidas para provisão e liberação de caminhos"""
     cdef TopologyCache topo_cache
-    cdef int num_spectrum_resources
+    cdef int total_spectrum_slots  # Renomeado para ser mais claro
     
-    def __init__(self, topo_cache: TopologyCache, num_spectrum_resources: int):
+    def __init__(self, topo_cache: TopologyCache, total_spectrum_slots: int):
         self.topo_cache = topo_cache
-        self.num_spectrum_resources = num_spectrum_resources
+        self.total_spectrum_slots = total_spectrum_slots
     
     cdef void fast_provision_path(self, cnp.int32_t[:] edge_indices, 
                                  int start_slot, int end_slot, 
@@ -85,11 +161,11 @@ cdef class FastPathOps:
     cdef bint batch_check_paths_free(self, list paths, int initial_slot, int number_slots):
         """Verificação em lote se múltiplos caminhos estão livres"""
         cdef int end = initial_slot + number_slots
-        if end > self.num_spectrum_resources:
+        if end > self.total_spectrum_slots:
             return False
         
         cdef int start = initial_slot
-        if end < self.num_spectrum_resources:
+        if end < self.total_spectrum_slots:
             end += 1
         
         cdef object path
@@ -107,7 +183,7 @@ cdef class FastPathOps:
     cdef cnp.ndarray[cnp.int32_t, ndim=1] vectorized_spectrum_product(self, cnp.ndarray[cnp.int32_t, ndim=1] edge_indices):
         """Produto vetorizado de espectros disponíveis para múltiplos links"""
         cdef int num_edges = edge_indices.shape[0]
-        cdef int num_slots = self.num_spectrum_resources
+        cdef int num_slots = self.total_spectrum_slots
         cdef cnp.ndarray[cnp.int32_t, ndim=2] available_matrix
         cdef cnp.ndarray[cnp.int32_t, ndim=1] result
         cdef int i, j
@@ -250,6 +326,7 @@ cdef class Service:
     cdef public double ASE
     cdef public double NLI
     cdef public object current_modulation
+    cdef public object current_band  # Nova banda atual
     cdef public bint recalculate
 
     def __init__(
@@ -301,6 +378,7 @@ cdef class Service:
         self.ASE = ASE
         self.NLI = NLI
         self.current_modulation = current_modulation
+        self.current_band = None  # Inicializar como None
         self.recalculate = False
 
     def __repr__(self):
@@ -312,7 +390,7 @@ cdef class Service:
             f"number_slots={self.number_slots}, core={self.core}, launch_power={self.launch_power}, accepted={self.accepted}, "
             f"blocked_due_to_resources={self.blocked_due_to_resources}, blocked_due_to_osnr={self.blocked_due_to_osnr}, "
             f"OSNR={self.OSNR}, ASE={self.ASE}, NLI={self.NLI}, current_modulation={self.current_modulation}, "
-            f"recalculate={self.recalculate})"
+            f"current_band={self.current_band}, recalculate={self.recalculate})"
         )
 
 cdef class QRMSAEnv:
@@ -398,6 +476,11 @@ cdef class QRMSAEnv:
     cdef int episode_defrag_cicles
     cdef int episode_service_realocations
     cdef bint gen_observation
+    
+    # Atributos para multibanda
+    cdef public list bands
+    cdef public int num_bands
+    cdef public int total_slots
 
     topology: cython.declare(nx.Graph, visibility="readonly")
     bit_rate_selection: cython.declare(Literal["continuous", "discrete"], visibility="readonly")
@@ -406,7 +489,7 @@ cdef class QRMSAEnv:
     def __init__(
         self,
         topology: nx.Graph,
-        num_spectrum_resources: int = 320,
+        band_specs,  # Obrigatório - lista de especificações de bandas
         episode_length: int = 1000,
         load: float = 10.0,
         mean_service_holding_time: double = 10800.0,
@@ -469,16 +552,27 @@ cdef class QRMSAEnv:
         # Criar cache de topologia para acelerar acesso aos dados
         self.topo_cache = TopologyCache(topology)
         
-        # Inicializar operações rápidas vetorizadas
-        self.fast_ops = FastPathOps(self.topo_cache, num_spectrum_resources)
+        # Configurar basic parameters necessários para _init_bands
+        self.k_paths = k_paths
+        self.modulations = self.topology.graph.get("modulations", [])
+        self.max_modulation_idx = len(self.modulations) - 1
+        self.modulations_to_consider = min(modulations_to_consider, len(self.modulations))
+        self.frequency_slot_bandwidth = frequency_slot_bandwidth  # Necessário antes de _init_bands
         
-        self.num_spectrum_resources = num_spectrum_resources
+        # Verificar se band_specs foi fornecido
+        if band_specs is None:
+            raise ValueError("band_specs is required. Must provide a list of band specifications.")
+        
+        # Inicializar bandas - num_spectrum_resources será calculado automaticamente
+        self._init_bands(band_specs, 0, frequency_start)  # 0 é ignorado agora
+        
+        # Inicializar operações rápidas vetorizadas (usar total_slots agora)
+        self.fast_ops = FastPathOps(self.topo_cache, self.total_slots)
         self.episode_length = episode_length
         self.load = load
         self.mean_service_holding_time = mean_service_holding_time
         self.channel_width = channel_width
         self.allow_rejection = allow_rejection
-        self.k_paths = k_paths
         self.k_shortest_paths = self.topology.graph["ksp"]
         if node_request_probabilities is not None:
             self.node_request_probabilities = node_request_probabilities
@@ -494,7 +588,7 @@ cdef class QRMSAEnv:
         self.launch_power = 10 ** ((self.launch_power_dbm - 30) / 10)
         self.bandwidth = bandwidth
         self.frequency_start = frequency_start
-        self.frequency_slot_bandwidth = frequency_slot_bandwidth
+        # frequency_slot_bandwidth já foi definido antes de _init_bands
         self.margin = margin
         self.measure_disruptions = measure_disruptions
         self.frequency_end = self.frequency_start + (self.frequency_slot_bandwidth * self.num_spectrum_resources)
@@ -516,23 +610,17 @@ cdef class QRMSAEnv:
         # Definir referência direta no cache
         self.topo_cache.set_available_slots_reference(self.topology.graph["available_slots"])
        
-        self.modulations = self.topology.graph.get("modulations", [])
-        self.max_modulation_idx = len(self.modulations) - 1
-        self.modulations_to_consider = min(modulations_to_consider, len(self.modulations))
         self.disrupted_services_list = []
         self.disrupted_services = 0
         self.episode_disrupted_services = 0
 
-        # Redefinir o espaço de ações para Discrete
-        self.action_space = gym.spaces.Discrete(
-            (self.k_paths * self.modulations_to_consider * self.num_spectrum_resources)+1
-        )
+        # O action_space é criado em _init_bands() após definir bandas
 
         total_dim = (
             1
             + 2
             + self.k_paths
-            + (self.k_paths * self.modulations_to_consider * 12)
+            + (self.k_paths * self.num_bands * self.modulations_to_consider * 12)  # Usar num_bands
         )
 
         self.observation_space = gym.spaces.Box(
@@ -554,12 +642,13 @@ cdef class QRMSAEnv:
         self.input_seed = int(input_seed)
         self._np_random, self._np_random_seed = seeding.np_random(self.input_seed)
         num_edges = self.topo_cache.num_edges  # Usar cache em vez de NetworkX
-        num_resources = self.num_spectrum_resources
+        
+        # Usar total_slots para arrays de espectro
         self.spectrum_use = np.zeros(
-            (num_edges, num_resources), dtype=np.int32
+            (num_edges, self.total_slots), dtype=np.int32
         )
         self.spectrum_allocation = np.full(
-            (num_edges, num_resources),
+            (num_edges, self.total_slots),
             fill_value=-1,
             dtype=np.int64
         )
@@ -587,10 +676,10 @@ cdef class QRMSAEnv:
             self.bit_rate_provisioned_histogram = None
         self.reject_action = self.action_space.n - 1 if allow_rejection else 0
         self.actions_output = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), dtype=np.int64
+            (self.k_paths + 1, self.total_slots + 1), dtype=np.int64  # Usar total_slots
         )
         self.actions_taken = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), dtype=np.int64
+            (self.k_paths + 1, self.total_slots + 1), dtype=np.int64  # Usar total_slots
         )
         if file_name != "":
             final_name = "_".join([
@@ -622,6 +711,91 @@ cdef class QRMSAEnv:
         if reset:
             self.reset()
 
+    def _init_bands(self, object band_specs, int unused_param, double frequency_start):
+        """Inicializa bandas de frequência a partir de band_specs (obrigatório)."""
+        print(f"[DEBUG] _init_bands: Iniciando com {len(band_specs)} band_specs")
+        cdef list bands = []
+        cdef Band band
+        cdef dict spec
+        cdef int current_offset = 0
+        cdef int i, j
+        cdef double prev_f_end = 0.0
+        
+        # Calcular num_spectrum_resources automaticamente baseado nas bandas
+        calculated_num_spectrum_resources = sum(
+            spec["num_slots"] if isinstance(spec, dict) else spec.num_slots 
+            for spec in band_specs
+        )
+        print(f"[DEBUG] _init_bands: Calculado num_spectrum_resources = {calculated_num_spectrum_resources}")
+        self.num_spectrum_resources = calculated_num_spectrum_resources
+        
+        # Converter specs para objetos Band se necessário
+        for spec in band_specs:
+            if isinstance(spec, Band):
+                bands.append(spec)
+            elif isinstance(spec, dict):
+                required_keys = {"name", "start_thz", "num_slots", "noise_figure_db", "attenuation_db_km"}
+                if not required_keys.issubset(spec.keys()):
+                    missing = required_keys - spec.keys()
+                    raise ValueError(f"Missing keys in band_specs: {missing}")
+                
+                band = Band(
+                    name=spec["name"],
+                    start_thz=spec["start_thz"],
+                    num_slots=spec["num_slots"],
+                    noise_figure_db=spec["noise_figure_db"],
+                    attenuation_db_km=spec["attenuation_db_km"],
+                    slot_bw_hz=self.frequency_slot_bandwidth
+                )
+                print(f"[DEBUG] _init_bands: Criada banda {band.name}: {spec['start_thz']} THz, {spec['num_slots']} slots")
+                bands.append(band)
+            else:
+                    raise ValueError(f"band_specs must contain Band objects or dicts, got {type(spec)}")
+        
+        # Ordenar bandas por frequência inicial
+        bands.sort(key=lambda b: b.f_start_hz)
+        print(f"[DEBUG] _init_bands: Bandas ordenadas por frequência")
+        
+        # Verificar sobreposições e atribuir offsets contíguos
+        for i, band in enumerate(bands):
+            if i > 0:
+                prev_band = bands[i-1]
+                if prev_band.f_end_hz > band.f_start_hz:
+                    raise ValueError(
+                        f"Band overlap detected: {prev_band.name} ends at {prev_band.f_end_hz/1e12:.2f} THz, "
+                        f"but {band.name} starts at {band.f_start_hz/1e12:.2f} THz"
+                    )
+            
+            band.set_slot_offset(current_offset)
+            print(f"[DEBUG] _init_bands: Banda {band.name} offset {current_offset}, slots [{band.slot_start}-{band.slot_end})")
+            current_offset += band.num_slots
+        
+        # Atribuir às variáveis de instância
+        self.bands = bands
+        self.num_bands = len(bands)
+        self.total_slots = current_offset
+        
+        print(f"[DEBUG] _init_bands: Finalizado - {self.num_bands} bandas, {self.total_slots} slots totais")
+        
+        # Atualizar action_space para usar slots por banda (não total)
+        # Assumindo bandas uniformes de 10 slots cada
+        slots_per_band = self.bands[0].num_slots  # Usar primeira banda como referência
+        action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * slots_per_band) + 1
+        print(f"[DEBUG] _init_bands: Action space = {self.k_paths} × {self.num_bands} × {self.modulations_to_consider} × {slots_per_band} + 1 = {action_space_size}")
+        self.action_space = gym.spaces.Discrete(action_space_size)
+
+    cpdef Band band_for_global_slot(self, int global_slot):
+        """Retorna a banda que contém o slot global especificado"""
+        print(f"[DEBUG] band_for_global_slot: Procurando banda para slot global {global_slot}")
+        cdef Band band
+        for band in self.bands:
+            print(f"[DEBUG] band_for_global_slot: Verificando banda {band.name} [{band.slot_start}, {band.slot_end})")
+            if band.slot_start <= global_slot < band.slot_end:
+                print(f"[DEBUG] band_for_global_slot: ✓ Slot {global_slot} encontrado na banda {band.name}")
+                return band
+        print(f"[DEBUG] band_for_global_slot: ✗ Nenhuma banda contém o slot {global_slot}")
+        raise ValueError(f"No band contains global slot {global_slot}")
+
     cpdef tuple reset(self, object seed=None, dict options=None):
         self.episode_bit_rate_requested = 0.0
         self.episode_bit_rate_provisioned = 0.0
@@ -637,11 +811,11 @@ cdef class QRMSAEnv:
         self.episode_service_realocations = 0
 
         self.episode_actions_output = np.zeros(
-            (self.k_paths + self.reject_action, self.num_spectrum_resources + self.reject_action),
+            (self.k_paths + self.reject_action, self.total_slots + self.reject_action),  # Usar total_slots
             dtype=np.int32
         )
         self.episode_actions_taken = np.zeros(
-            (self.k_paths + self.reject_action, self.num_spectrum_resources + self.reject_action),
+            (self.k_paths + self.reject_action, self.total_slots + self.reject_action),  # Usar total_slots
             dtype=np.int32
         )
 
@@ -676,14 +850,14 @@ cdef class QRMSAEnv:
             self.topo_cache.edge_running_services[edge_idx] = []
 
         self.topology.graph["available_slots"] = np.ones(
-            (self.topo_cache.num_edges, self.num_spectrum_resources),
+            (self.topo_cache.num_edges, self.total_slots),  # Usar total_slots
             dtype=np.int32
         )
         # Atualizar referência direta no cache
         self.topo_cache.set_available_slots_reference(self.topology.graph["available_slots"])
 
         self.spectrum_slots_allocation = np.full(
-            (self.topo_cache.num_edges, self.num_spectrum_resources),
+            (self.topo_cache.num_edges, self.total_slots),  # Usar total_slots
             fill_value=-1,
             dtype=np.int32
         )
@@ -743,44 +917,93 @@ cdef class QRMSAEnv:
                             candidates.append(candidate)
         return candidates
 
+    cpdef _get_candidates_in_band(self, available_slots, int num_slots_required, Band band):
+        """
+        Gera candidatos para alocação dentro de uma banda específica.
+        Não permite cruzar fronteiras de banda.
+        
+        Args:
+            available_slots (np.array): Vetor global com slots disponíveis.
+            num_slots_required (int): Número de slots necessários.
+            band (Band): Banda onde buscar candidatos.
+        
+        Returns:
+            list: Lista de candidatos (índices globais) válidos.
+        """
+        
+        # Extrair apenas a janela da banda
+        band_available = available_slots[band.slot_start:band.slot_end]
+        
+        # Usar a lógica existente na janela da banda
+        initial_indices, values, lengths = rle(band_available)
+        candidates = []
+        
+        for start, val, length in zip(initial_indices, values, lengths):
+            if val == 1:
+                # Verificar se o bloco vai até o final da BANDA (não do espectro total)
+                is_end_of_band = (start + length == band.num_slots)
+                
+                if is_end_of_band:
+                    # Final da banda: não exige guard band
+                    if length >= num_slots_required:
+                        range_start = start
+                        range_end = start + length - num_slots_required + 1
+                        
+                        for candidate in range(range_start, range_end):
+                            # Converter para índice global
+                            global_candidate = band.slot_start + candidate
+                            candidates.append(global_candidate)
+                else:
+                    # Meio da banda: exige guard band
+                    if length >= (num_slots_required + 1):
+                        range_start = start
+                        range_end = start + length - (num_slots_required + 1) + 1
+                        
+                        for candidate in range(range_start, range_end):
+                            # Converter para índice global
+                            global_candidate = band.slot_start + candidate
+                            candidates.append(global_candidate)
+        
+        return candidates
+
     cpdef public get_max_modulation_index(self):
         """
-        Atualiza self.max_modulation_idx com a melhor modulação (maior índice) cuja alocação
-        apresenta OSNR aceitável (>= limiar + margin). Usa a mesma lógica de geração de candidatos.
+        Atualiza self.max_modulation_idx considerando (path × banda × modulation).
+        Usa candidatos por banda e OSNR de observação com NF/α da banda.
         """
         for path in self.k_shortest_paths[self.current_service.source, self.current_service.destination]:
             available_slots = self.get_available_slots(path)
             
-            for idm, modulation in enumerate(reversed(self.modulations)):
-                number_slots = self.get_number_slots(self.current_service, modulation)
-                candidatos = self._get_candidates(available_slots, number_slots, self.num_spectrum_resources)
-                
-                if candidatos:
-                    for candidate in candidatos:
-                        self.current_service.path = path
-                        self.current_service.initial_slot = candidate
-                        self.current_service.number_slots = number_slots
-                        self.current_service.center_frequency = (
-                            self.frequency_start +
-                            self.frequency_slot_bandwidth * (candidate + number_slots / 2)
-                        )
-                        self.current_service.bandwidth = self.frequency_slot_bandwidth * number_slots
-                        self.current_service.launch_power = self.launch_power
-                        self.current_service.blocked_due_to_resources = False
+            for band in self.bands:
+                for idm, modulation in enumerate(reversed(self.modulations)):
+                    number_slots = self.get_number_slots(self.current_service, modulation)
+                    
+                    # Usar candidatos dentro da banda
+                    candidatos = self._get_candidates_in_band(available_slots, number_slots, band)
+                    
+                    if candidatos:
+                        for candidate in candidatos:
+                            # Calcular centro de frequência via banda
+                            center_frequency = band.center_frequency_hz_from_global(candidate, number_slots)
+                            
+                            # Usar OSNR de observação com parâmetros da banda
+                            osnr_obs = calculate_osnr_observation(
+                                self,
+                                path.links,
+                                self.frequency_slot_bandwidth * number_slots,  # bandwidth
+                                center_frequency,
+                                self.current_service.service_id,
+                                self.launch_power,
+                                modulation.minimum_osnr + self.margin,
+                                band  # Passar banda para usar NF/α específicos
+                            )
 
-                        osnr, _, _ = calculate_osnr(self, self.current_service)
-                        
-                        self.current_service.path = None
-                        self.current_service.initial_slot = -1
-                        self.current_service.number_slots = 0
-                        self.current_service.center_frequency = 0.0
-                        self.current_service.bandwidth = 0.0
-                        self.current_service.launch_power = 0.0
-
-                        if osnr >= modulation.minimum_osnr + self.margin:
-                            self.max_modulation_idx = max(len(self.modulations) - idm - 1,
-                                                        self.modulations_to_consider - 1)
-                            return
+                            if osnr_obs >= 0:  # OSNR aceitável
+                                self.max_modulation_idx = max(len(self.modulations) - idm - 1,
+                                                            self.modulations_to_consider - 1)
+                                return
+        
+        # Se nenhuma modulação funcionou, usar a mais conservadora
         self.max_modulation_idx = self.modulations_to_consider - 1
 
     def observation(self):
@@ -789,29 +1012,32 @@ cdef class QRMSAEnv:
             action_mask = np.zeros((self.action_space.n,),           dtype=np.uint8)
             return obs, {'mask': action_mask}
             
-        def compute_modulation_features(available_slots, num_slots_required, route_links, modulation):
-            valid_starts = self._get_candidates(available_slots, num_slots_required, self.num_spectrum_resources)
+        def compute_modulation_features(available_slots, num_slots_required, route_links, modulation, band):
+            # Usar candidatos específicos da banda ao invés de candidatos globais
+            valid_starts = self._get_candidates_in_band(available_slots, num_slots_required, band)
             candidate_count = len(valid_starts)
-            feature_candidate_count = candidate_count / self.num_spectrum_resources
+            feature_candidate_count = candidate_count / band.num_slots  # Normalizar pela banda, não pelo total
+            
             if candidate_count > 0:
-                avg_candidate = np.mean(valid_starts)
-                std_candidate = np.std(valid_starts)
-                max_candidate = max(valid_starts)
+                # Converter para slots locais da banda para cálculos de features
+                local_starts = [slot - band.slot_start for slot in valid_starts]
+                avg_candidate = np.mean(local_starts)
+                std_candidate = np.std(local_starts)
+                max_candidate = max(local_starts)
             else:
                 avg_candidate = std_candidate = max_candidate = 0.0
-            feature_avg_candidate = avg_candidate / (self.num_spectrum_resources - 1)
-            feature_std_candidate = std_candidate / (self.num_spectrum_resources - 1)
-            feature_max_candidate = max_candidate / (self.num_spectrum_resources - 1)
+            
+            feature_avg_candidate = avg_candidate / (band.num_slots - 1) if band.num_slots > 1 else 0.0
+            feature_std_candidate = std_candidate / (band.num_slots - 1) if band.num_slots > 1 else 0.0
+            feature_max_candidate = max_candidate / (band.num_slots - 1) if band.num_slots > 1 else 0.0
             
             osnr_values = []
             osnr_best = 0.0
             for init_slot in valid_starts:
                 service_bandwidth = num_slots_required * self.channel_width * 1e9
-                service_center_frequency = (
-                    self.frequency_start +
-                    (self.channel_width * 1e9 * init_slot) +
-                    (self.channel_width * 1e9 * (num_slots_required / 2.0))
-                )
+                # Usar banda para calcular frequência central corretamente
+                service_center_frequency = band.center_frequency_hz_from_global(init_slot, num_slots_required)
+                
                 osnr_current = calculate_osnr_observation(
                     self,
                     route_links,
@@ -832,12 +1058,14 @@ cdef class QRMSAEnv:
             
             adjusted_slots_required = max((num_slots_required - 5.5) / 3.5, 0.0)
             
-            total_available_slots = np.sum(available_slots)
-            total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * self.num_spectrum_resources) / self.num_spectrum_resources
+            # Usar slots disponíveis da banda, não globais
+            band_available = available_slots[band.slot_start:band.slot_end]
+            total_available_slots = np.sum(band_available)
+            total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * band.num_slots) / band.num_slots
             
             blocks_sizes = []
             current_len = 0
-            for slot in available_slots:
+            for slot in band_available:
                 if slot == 1:
                     current_len += 1
                 else:
@@ -852,7 +1080,7 @@ cdef class QRMSAEnv:
             else:
                 mean_block_size = std_block_size = 0.0
             
-            link_usage_normalized = 2.0 * ((np.sum(available_slots) / self.num_spectrum_resources) - 0.5)
+            link_usage_normalized = 2.0 * ((np.sum(band_available) / band.num_slots) - 0.5)
             
             features = [feature_candidate_count,
                         feature_avg_candidate,
@@ -909,46 +1137,90 @@ cdef class QRMSAEnv:
             paths_info.append((route, available_slots))
 
         # ========================
-        # Cálculo das features de observação por (caminho, modulação)
+        # Cálculo das features de observação por (caminho, banda, modulação)
         # ========================
-        mod_features_obs = np.full((num_paths_to_evaluate * num_mod_to_consider, 12), fill_value=-1.0, dtype=np.float32)
+        mod_features_obs = np.full((num_paths_to_evaluate * self.num_bands * num_mod_to_consider, 12), fill_value=-1.0, dtype=np.float32)
         mod_features_cache = {}
+        # Include service bit rate in cache key to avoid sharing between different services
+        service_bit_rate = current_service.bit_rate
+        
         for p_idx in range(num_paths_to_evaluate):
             route, available_slots = paths_info[p_idx]
             start_index = 0 if self.max_modulation_idx <= 1 else max(0, self.max_modulation_idx - (num_mod_to_consider - 1))
             mod_list = list(reversed(modulations[start_index: num_mod_to_consider + start_index]))
-            for m_idx in range(num_mod_to_consider):
-                modulation = mod_list[m_idx]
-                num_slots_required = self.get_number_slots(current_service, modulation)
-                valid_starts, features, osnr_values = compute_modulation_features(available_slots, num_slots_required, route.links, modulation)
-                mod_features_obs[p_idx * num_mod_to_consider + m_idx, :] = np.array(features, dtype=np.float32)
-                mod_features_cache[(p_idx, m_idx)] = (valid_starts, features, num_slots_required, modulation)
+            
+            for band_idx, band in enumerate(self.bands):
+                for m_idx in range(num_mod_to_consider):
+                    modulation = mod_list[m_idx]
+                    num_slots_required = self.get_number_slots(current_service, modulation)
+                    
+                    # Calcular features específicas para esta banda
+                    valid_starts, features, osnr_values = compute_modulation_features(
+                        available_slots, num_slots_required, route.links, modulation, band
+                    )
+                    
+                    # Índice único para (path, band, modulation)
+                    feature_idx = p_idx * self.num_bands * num_mod_to_consider + band_idx * num_mod_to_consider + m_idx
+                    mod_features_obs[feature_idx, :] = np.array(features, dtype=np.float32)
+                    
+                    # Cache com chave (path, band, modulation, bit_rate)
+                    mod_features_cache[(p_idx, band_idx, m_idx, service_bit_rate)] = (valid_starts, features, num_slots_required, modulation)
 
         # ========================
-        # Geração da máscara de ações (permanece inalterada)
+        # Geração da máscara de ações (atualizada para multibanda)
         # ========================
-        total_actions = num_paths_to_evaluate * num_mod_to_consider * num_spectrum_resources
+        total_actions = self.action_space.n - 1  # Excluindo ação dummy
         action_mask = np.zeros(total_actions + 1, dtype=np.uint8)
 
         for action_index in range(total_actions):
-            p_idx = action_index // (num_mod_to_consider * num_spectrum_resources)
-            mod_and_slot = action_index % (num_mod_to_consider * num_spectrum_resources)
-            m_idx = mod_and_slot // num_spectrum_resources
-            init_slot = mod_and_slot % num_spectrum_resources
+            # Decodificar ação usando slots por banda (não total)
+            slots_per_band = self.bands[0].num_slots
+            decoded = self.decimal_to_array(
+                action_index,
+                [self.k_paths, self.num_bands, self.modulations_to_consider, slots_per_band]
+            )
+            p_idx, band_idx, modulation_idx, slot_relative = decoded
+            
+            # Converter slot relativo para slot global dentro da banda
+            band = self.bands[band_idx]
+            init_slot = band.slot_start + slot_relative
 
+            # Verificar se índices são válidos
+            if (p_idx >= num_paths_to_evaluate or 
+                band_idx >= len(self.bands) or 
+                modulation_idx >= len(self.modulations)):
+                continue
+
+            # Converter modulation_idx de volta para índice relativo para acessar cache
+            if self.max_modulation_idx > 1:
+                allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - self.modulations_to_consider, -1))
+            else:
+                allowed_mods = list(range(0, self.modulations_to_consider))
+            
+            try:
+                m_idx_relative = allowed_mods.index(modulation_idx)
+            except ValueError:
+                # Modulação inválida
+                continue
+
+            # Recupera os dados de modulação do cache usando chave (path, band, modulation, bit_rate)
             route, available_slots = paths_info[p_idx]
-            # Recupera os dados de modulação do cache
-            valid_starts, features, num_slots_required, modulation = mod_features_cache[(p_idx, m_idx)]
+            band = self.bands[band_idx]
+            valid_starts, features, num_slots_required, modulation = mod_features_cache[(p_idx, band_idx, m_idx_relative, service_bit_rate)]
 
             valid_action = False
             osnr_current = 0.0
-            if init_slot in valid_starts:
+            
+            # Verificar se slot está dentro da banda e se existe no conjunto de starts válidos
+            slot_in_band = (init_slot >= band.slot_start and init_slot + num_slots_required <= band.slot_end)
+            slot_in_valid_starts = (init_slot in valid_starts)
+            
+            if slot_in_band and slot_in_valid_starts:
+                
                 service_bandwidth = num_slots_required * frequency_slot_bandwidth
-                service_center_frequency = (
-                    self.frequency_start +
-                    (frequency_slot_bandwidth * init_slot) +
-                    (frequency_slot_bandwidth * (num_slots_required / 2.0))
-                )
+                # Usar banda para calcular frequência central
+                service_center_frequency = band.center_frequency_hz_from_global(init_slot, num_slots_required)
+                
                 osnr_current = calculate_osnr_observation(
                     self,
                     route.links,
@@ -958,80 +1230,110 @@ cdef class QRMSAEnv:
                     10 ** ((self.launch_power_dbm - 30) / 10),
                     modulation.minimum_osnr
                 )
+                
                 if osnr_current >= 0:
                     valid_action = True
 
+            # DEBUG: Print resumido para todas as ações (removendo filtro)
+            #if True:  # Mostrar todas as ações
+                #if valid_action:
+                    #print(f"[MASK DEBUG] Ação {action_index}: ✅ VÁLIDA - slot {slot_relative}, {modulation.name}, band {band.name}, path {p_idx}, OSNR={osnr_current:.2f}")
+                #else:
+                    #if not slot_in_band:
+                        #print(f"[MASK DEBUG] Ação {action_index}: ❌ INVÁLIDA - slot {slot_relative}, {modulation.name}, band {band.name}, path {p_idx} - slot fora da banda")
+                    #elif not slot_in_valid_starts:
+                        #print(f"[MASK DEBUG] Ação {action_index}: ❌ INVÁLIDA - slot {slot_relative}, {modulation.name}, band {band.name}, path {p_idx} - slot não está em valid_starts")
+                    #else:
+                        #print(f"[MASK DEBUG] Ação {action_index}: ❌ INVÁLIDA - slot {slot_relative}, {modulation.name}, band {band.name}, path {p_idx} - OSNR insuficiente ({osnr_current:.2f})")
+
             if valid_action:
                 action_mask[action_index] = 1
-
-        # Define a ação dummy (última posição) como válida
+            else:
+                action_mask[action_index] = 0        # Define a ação dummy (última posição) como válida
         action_mask[-1] = 1
 
         # ========================
         # Construção final da observação
         # ========================
         # As features de ação agora vêm de mod_features_obs, que tem dimensão:
-        # (k_paths * modulations_to_consider, 12)
+        # (k_paths * num_bands * modulations_to_consider, 12)
         spectrum_obs_flat = mod_features_obs.flatten().astype(np.float32)
         observation = np.concatenate([
             bit_rate_obs,                         # 1 valor
             source_destination.flatten(),         # 2 valores
             route_lengths.flatten(),              # k_paths valores
-            spectrum_obs_flat                     # (k_paths * modulations_to_consider * 12) valores
+            spectrum_obs_flat                     # (k_paths * num_bands * modulations_to_consider * 12) valores
         ], axis=0).astype(np.float32)
 
         return observation, {'mask': action_mask}
 
 
 
-    cpdef decimal_to_array(self, decimal: int, max_values=None):
-        if max_values is None:
-            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]       
+    cpdef simple_decimal_to_array(self, decimal: int, max_values):
+        """Decodificação simples sem transformações adicionais - para uso na máscara"""
         array = []
         for max_val in reversed(max_values):
             digit = decimal % max_val
             array.insert(0, digit)
             decimal //= max_val
+        return array
+
+    cpdef simple_array_to_decimal(self, array, max_values):
+        """Encoding simples sem transformações adicionais - inverso da decodificação simples"""
+        decimal = 0
+        for i in range(len(array)):
+            multiplier = 1
+            for j in range(i + 1, len(max_values)):
+                multiplier *= max_values[j]
+            decimal += array[i] * multiplier
+        return decimal
+
+    cpdef decimal_to_array(self, decimal: int, max_values=None):
+        if max_values is None:
+            # Agora incluindo banda: [k_path, band_idx, mod_idx_relative, global_slot]
+            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.total_slots]
+        
+        array = []
+        for max_val in reversed(max_values):
+            digit = decimal % max_val
+            array.insert(0, digit)
+            decimal //= max_val
+        
+        # Mapear mod_idx_relative para modulation_idx real (índice 2 agora)
         if self.max_modulation_idx > 1:
             allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - (self.modulations_to_consider - 1), -1))
         else:
             allowed_mods = list(range(0, self.modulations_to_consider))
-        array[1] = allowed_mods[array[1]]
-        # print(f"k:{self.k_shortest_paths[self.current_service.source,self.current_service.destination][array[0]]}, mod: {self.modulations[array[1]]}, slot: {array[2]}")
+        
+        original_mod = array[2]
+        array[2] = allowed_mods[array[2]]  # Ajustado para posição 2
+        
+        # print(f"k:{self.k_shortest_paths[self.current_service.source,self.current_service.destination][array[0]]}, band: {self.bands[array[1]]}, mod: {self.modulations[array[2]]}, slot: {array[3]}")
         return array
 
     cpdef encoded_decimal_to_array(self, decimal: int, max_values=None):
-        # Usa divisão inteira para garantir um valor inteiro para part_size.
-        part_size = self.num_spectrum_resources // self.modulations_to_consider  
-        mod_idx = decimal // part_size  # Calculado mas não usado para modulação
-        # print(f"Input decimal: {decimal}")
-        
         if max_values is None:
-            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
-        # print(f"Max values: {max_values}")
+            # Para multibanda, usar 4 dimensões: [k_path, band, modulation, slot]
+            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.total_slots]
         
         array = []
-        # Decomposição do número decimal com base nos valores máximos (ordem: [k_path, modulação, slot])
+        # Decomposição do número decimal com base nos valores máximos
         for max_val in reversed(max_values):
             digit = decimal % max_val
-            # print(f"Current max_val: {max_val}, digit: {digit}")
             array.insert(0, digit)
             decimal //= max_val
-            # print(f"Updated decimal: {decimal}")
         
         # Cria a lista de modulações permitidas
         if self.max_modulation_idx > 1:
-            # Remove o 'reversed' para manter a ordem desejada: maior para menor.
             allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - self.modulations_to_consider, -1))
         else:
             allowed_mods = list(reversed(list(range(0, self.modulations_to_consider))))
-        # print(f"Allowed mods: {allowed_mods}")
         
         # Atualiza o dígito de modulação usando o dígito extraído da decomposição
-        array[1] = allowed_mods[array[1]]
-        # print(f"Decoded array: {array}")
-        # print(f"k: {self.k_shortest_paths[self.current_service.source, self.current_service.destination][array[0]]}, "
-        #     f"mod: {self.modulations[array[1]]}, slot: {array[2]}")
+        # Com 4 dimensões: [path, band, modulation, slot] - modulation está no índice 2
+        array[2] = allowed_mods[array[2]]
+        
+        return array
         
         return array
 
@@ -1039,6 +1341,7 @@ cdef class QRMSAEnv:
 
     cpdef tuple[object, float, bint, bint, dict] step(self, int action):
         cdef int route = -1
+        cdef int band_idx = -1  # Nova variável para banda
         cdef int modulation_idx = -1
         cdef int initial_slot = -1
         cdef int number_slots = 0
@@ -1054,6 +1357,7 @@ cdef class QRMSAEnv:
 
         cdef object modulation = None
         cdef object path = None
+        cdef Band band = None  # Nova variável para banda
         cdef list services_to_measure = []
         cdef dict info
 
@@ -1066,13 +1370,22 @@ cdef class QRMSAEnv:
             self.current_service.blocked_due_to_osnr = False
             self.bl_reject += 1
         else:
-            decoded = self.encoded_decimal_to_array(
+            # Usar decodificação com slots por banda: [k_path, band_idx, mod_idx_relative, slot_relative]
+            slots_per_band = self.bands[0].num_slots
+            decoded = self.decimal_to_array(
                 action,
-                [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
+                [self.k_paths, self.num_bands, self.modulations_to_consider, slots_per_band]
             )
             route = decoded[0]
-            modulation_idx = decoded[1]
-            initial_slot = decoded[2]
+            band_idx = decoded[1]
+            modulation_idx = decoded[2]  # Já é o índice real da modulação
+            slot_relative = decoded[3]
+            
+            # Converter slot relativo para slot global
+            band = self.bands[band_idx]
+            initial_slot = band.slot_start + slot_relative
+            
+            band = self.bands[band_idx]
             modulation = self.modulations[modulation_idx]
             osnr_req = modulation.minimum_osnr + self.margin
             path = self.k_shortest_paths[
@@ -1084,15 +1397,24 @@ cdef class QRMSAEnv:
                 service=self.current_service,
                 modulation=modulation
             )
+            
+            # Validar se o bloco está totalmente dentro da banda
+            if not band.contains_slot_range(initial_slot, number_slots):
+                raise ValueError(
+                    f"Action invalid: slot range [{initial_slot}, {initial_slot + number_slots}) "
+                    f"not within band {band.name} range [{band.slot_start}, {band.slot_end})"
+                )
+            
             if self.is_path_free(path=path, initial_slot=initial_slot, number_slots=number_slots):
+                print(f"[DEBUG] step: ✓ Caminho está livre para alocação")
                 self.current_service.path = path
                 self.current_service.initial_slot = initial_slot
                 self.current_service.number_slots = number_slots
-                self.current_service.center_frequency = (
-                    self.frequency_start
-                    + (self.frequency_slot_bandwidth * initial_slot)
-                    + (self.frequency_slot_bandwidth * (number_slots / 2.0))
-                )
+                self.current_service.current_band = band  # Definir banda atual
+                
+                # Calcular frequência central usando a banda
+                self.current_service.center_frequency = band.center_frequency_hz_from_global(initial_slot, number_slots)
+                
                 self.current_service.bandwidth = self.frequency_slot_bandwidth * number_slots
                 self.current_service.launch_power = self.launch_power
 
@@ -1113,18 +1435,8 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
-                    raise ValueError(
-                        f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
-                        f"with modulation {modulation}, and osnr_req {osnr_req}."
-                    )
-                    self.current_service.accepted = False
-                    self.current_service.blocked_due_to_osnr = True
                     self.bl_osnr += 1
             else:
-                raise ValueError(
-                    f"Path {path} is not free for service {self.current_service.service_id} "
-                    f"with initial slot {initial_slot} and number of slots {number_slots}."
-                )
                 self.current_service.accepted = False
                 self.current_service.blocked_due_to_resources = True
                 self.bl_resource += 1
@@ -1153,9 +1465,9 @@ cdef class QRMSAEnv:
 
         if not self.current_service.accepted:
             if action == (self.action_space.n - 1):
-                self.actions_taken[self.k_paths, self.num_spectrum_resources] += 1
+                self.actions_taken[self.k_paths, self.total_slots] += 1  # Usar total_slots
             else:
-                self.actions_taken[self.k_paths, self.num_spectrum_resources] += 1
+                self.actions_taken[self.k_paths, self.total_slots] += 1  # Usar total_slots
 
             self.current_service.path = None
             self.current_service.initial_slot = -1
@@ -1163,6 +1475,7 @@ cdef class QRMSAEnv:
             self.current_service.OSNR = 0.0
             self.current_service.ASE = 0.0
             self.current_service.NLI = 0.0
+            self.current_service.current_band = None  # Limpar banda
 
         if self.file_stats is not None:
             line = "{},{},{},{},".format(
@@ -1728,7 +2041,13 @@ cdef class QRMSAEnv:
             path = service.path
             number_slots = service.number_slots
             available_slots = self.get_available_slots(path)
-            candidates = self._get_candidates(available_slots, number_slots, self.num_spectrum_resources)
+            
+            # Mover serviços apenas dentro da própria banda
+            if hasattr(service, 'current_band') and service.current_band is not None:
+                candidates = self._get_candidates_in_band(available_slots, number_slots, service.current_band)
+            else:
+                # Fallback para compatibilidade se não tem banda
+                candidates = self._get_candidates(available_slots, number_slots, self.total_slots)
 
             if not candidates:
                 continue
@@ -1740,17 +2059,23 @@ cdef class QRMSAEnv:
 
                 start_slot = candidate
                 end_slot = start_slot + number_slots
-                if end_slot < self.num_spectrum_resources:
+                if end_slot < self.total_slots:  # Usar total_slots
                     end_slot += 1
-                elif end_slot > self.num_spectrum_resources:
+                elif end_slot > self.total_slots:  # Usar total_slots
                     continue  
 
                 service.initial_slot = start_slot
-                service.center_frequency = self.frequency_start + (
-                    self.frequency_slot_bandwidth * start_slot
-                ) + (
-                    self.frequency_slot_bandwidth * (number_slots / 2.0)
-                )
+                
+                # Atualizar center_frequency usando banda se disponível
+                if hasattr(service, 'current_band') and service.current_band is not None:
+                    service.center_frequency = service.current_band.center_frequency_hz_from_global(start_slot, number_slots)
+                else:
+                    # Fallback para cálculo original
+                    service.center_frequency = self.frequency_start + (
+                        self.frequency_slot_bandwidth * start_slot
+                    ) + (
+                        self.frequency_slot_bandwidth * (number_slots / 2.0)
+                    )
                 service.bandwidth = self.frequency_slot_bandwidth * number_slots
                 service.launch_power = self.launch_power
 
