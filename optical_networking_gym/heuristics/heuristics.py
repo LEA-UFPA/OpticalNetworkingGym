@@ -34,12 +34,45 @@ def get_qrmsa_env(env: Env) -> QRMSAEnv:
 def get_action_index(env: QRMSAEnv, path_index: int, modulation_index: int, initial_slot: int) -> int:
     """
     Converte (path_index, modulation_index, initial_slot) em um índice de ação inteiro.
+    Para ambientes multiband, usa get_multiband_action_index.
     
     Args:
         env (QRMSAEnv): O ambiente QRMSAEnv.
         path_index (int): Índice da rota.
         modulation_index (int): Índice absoluto da modulação.
-        initial_slot (int): Slot inicial para alocação.
+        initial_slot (int): Slot inicial para alocação (global para multiband).
+    
+    Returns:
+        int: Índice da ação correspondente.
+    """
+    # Verificar se é ambiente multiband
+    if hasattr(env, 'bands') and env.bands:
+        # Para multiband, precisa determinar a banda e slot relativo
+        for band_idx, band in enumerate(env.bands):
+            if band.contains_slot_range(initial_slot, 1):  # Verifica se o slot está na banda
+                slot_in_band = band.global_to_local(initial_slot)
+                return get_multiband_action_index(env, path_index, band_idx, modulation_index, slot_in_band)
+        raise ValueError(f"Slot global {initial_slot} não pertence a nenhuma banda")
+    else:
+        # Ambiente single-band original
+        relative_modulation_index = env.max_modulation_idx - modulation_index
+        return (path_index * env.modulations_to_consider * env.num_spectrum_resources +
+                relative_modulation_index * env.num_spectrum_resources +
+                initial_slot)
+
+
+def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int, 
+                              modulation_index: int, slot_in_band: int) -> int:
+    """
+    Converte (path_index, band_index, modulation_index, slot_in_band) em um índice de ação 
+    para ambiente multiband.
+    
+    Args:
+        env (QRMSAEnv): O ambiente QRMSAEnv.
+        path_index (int): Índice da rota.
+        band_index (int): Índice da banda.
+        modulation_index (int): Índice absoluto da modulação.
+        slot_in_band (int): Slot relativo dentro da banda (não global).
     
     Returns:
         int: Índice da ação correspondente.
@@ -47,9 +80,17 @@ def get_action_index(env: QRMSAEnv, path_index: int, modulation_index: int, init
     # Converter o índice absoluto da modulação para o relativo
     relative_modulation_index = env.max_modulation_idx - modulation_index
     
-    return (path_index * env.modulations_to_consider * env.num_spectrum_resources +
-            relative_modulation_index * env.num_spectrum_resources +
-            initial_slot)
+    # Obter número de slots por banda (assumindo bandas uniformes)
+    slots_per_band = env.bands[0].num_slots if env.bands else env.num_spectrum_resources
+    
+    # Fórmula baseada na estrutura do action space:
+    # action_space_size = (k_paths * num_bands * modulations_to_consider * slots_per_band) + 1
+    action_index = (path_index * env.num_bands * env.modulations_to_consider * slots_per_band +
+                   band_index * env.modulations_to_consider * slots_per_band +
+                   relative_modulation_index * slots_per_band +
+                   slot_in_band)
+    
+    return action_index
 
 # def decimal_to_array(env: QRMSAEnv, decimal: int, max_values: list[int] = None) -> list[int]:
 #     if max_values is None:
@@ -753,3 +794,107 @@ def try_allocate_in_band(sim_env, k_paths, band_idx):
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, service.initial_slot)
                 return action_index, False, False
     return None
+
+
+def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tuple[int, bool, bool]:
+    """
+    Heurística que tenta alocar na rota mais curta disponível, com first-fit,
+    melhor modulação e melhor banda (versão corrigida para multiband).
+    
+    Returns:
+        tuple[int, bool, bool]: (action_index, blocked_due_to_resources, blocked_due_to_osnr)
+    """
+    blocked_due_to_resources, blocked_due_to_osnr = False, False
+    sim_env = get_qrmsa_env(env)
+    source = sim_env.current_service.source
+    destination = sim_env.current_service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+    
+    # Verificar se o ambiente tem bandas
+    if not hasattr(sim_env, 'bands') or not sim_env.bands:
+        print("AVISO: Ambiente não tem bandas configuradas, usando heurística single-band")
+        return heuristic_shortest_available_path_first_fit_best_modulation(env)
+    
+    bands = sim_env.bands
+    
+    for path_idx, path in enumerate(k_paths):
+        for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[modulation_idx]
+            required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+            
+            if required_slots <= 0:
+                continue 
+            
+            for band_idx, band in enumerate(bands):
+                # Obter slots disponíveis do caminho
+                available_slots = sim_env.get_available_slots(path)
+                
+                # Usar _get_candidates_in_band corretamente (apenas 3 parâmetros)
+                try:
+                    valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+                except Exception as e:
+                    print(f"Erro ao chamar _get_candidates_in_band: {e}")
+                    blocked_due_to_resources = True
+                    continue
+
+                if not valid_starts:
+                    blocked_due_to_resources = True
+                    continue 
+                
+                # Usar primeiro candidato (first-fit)
+                global_candidate_start = valid_starts[0]
+                
+                # Verificar se o slot está dentro da banda
+                if not band.contains_slot_range(global_candidate_start, required_slots):
+                    print(f"ERRO: Slot global {global_candidate_start} não está na banda {band.name}")
+                    continue
+                
+                # Converter para slot relativo na banda
+                slot_in_band = band.global_to_local(global_candidate_start)
+                
+                # Configurar o serviço para teste de OSNR
+                service = sim_env.current_service
+                service.path = path
+                service.initial_slot = global_candidate_start
+                service.number_slots = required_slots
+                service.current_modulation = modulation
+                service.current_band = band
+                
+                # Calcular frequência central usando a banda
+                try:
+                    service.center_frequency = band.center_frequency_hz_from_global(
+                        global_candidate_start, required_slots
+                    )
+                except Exception as e:
+                    print(f"Erro ao calcular frequência central: {e}")
+                    # Fallback para cálculo tradicional
+                    service.center_frequency = (
+                        sim_env.frequency_start +
+                        (sim_env.frequency_slot_bandwidth * global_candidate_start) +
+                        (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+                    )
+                
+                service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+                service.launch_power = sim_env.launch_power
+                
+                # Verificar OSNR
+                try:
+                    osnr, _, _ = calculate_osnr(sim_env, service)
+                    threshold = modulation.minimum_osnr + sim_env.margin
+                    
+                    if osnr >= threshold:
+                        # Calcular action index corretamente
+                        action_index = get_multiband_action_index(
+                            sim_env, path_idx, band_idx, modulation_idx, slot_in_band
+                        )
+                        return action_index, False, False
+                    else:
+                        blocked_due_to_osnr = True
+                        # Reset blocked_due_to_resources se há problema de OSNR
+                        if blocked_due_to_resources:
+                            blocked_due_to_resources = False
+                except Exception as e:
+                    print(f"Erro no cálculo de OSNR: {e}")
+                    blocked_due_to_osnr = True
+    
+    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
