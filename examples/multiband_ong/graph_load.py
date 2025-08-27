@@ -8,6 +8,7 @@ from multiprocessing import Pool
 import numpy as np
 import time
 from datetime import datetime
+from tqdm import tqdm
 
 from optical_networking_gym.topology import Modulation, get_topology
 
@@ -16,7 +17,7 @@ from optical_networking_gym.topology import Modulation, get_topology
 # ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
-        return np.arange(100, 501, 100)
+        return np.arange(900, 1201, 100)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
@@ -54,6 +55,7 @@ def run_environment(
     defragmentation,
     n_defrag_services,
     gen_observation,
+    band_specs: List[dict] = None,
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
@@ -76,6 +78,9 @@ def run_environment(
     :param margin: Margem.
     :param file_name: Nome do arquivo para salvar serviços.
     :param measure_disruptions: Medir interrupções.
+    :param defragmentation: Habilita defragmentação.
+    :param n_defrag_services: Número de serviços defragmentados por ciclo.
+    :param gen_observation: Gera observação para agentes RL.
     """
     from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
     from optical_networking_gym.heuristics.heuristics import (
@@ -87,6 +92,7 @@ def run_environment(
         heuristic_shortest_available_path_first_fit_best_modulation,
         heuristic_highest_snr,
         heuristic_lowest_fragmentation,
+        heuristic_priority_band_C_then_L,
     )
 
     # Configurações do ambiente
@@ -122,6 +128,8 @@ def run_environment(
         fn_heuristic = heuristic_lowest_fragmentation
     elif heuristic == 4:
         fn_heuristic = load_balancing_best_modulation
+    elif heuristic == 5:  # Escolha um índice para sua heurística de prioridade
+        fn_heuristic = heuristic_priority_band_C_then_L
     else:
         raise ValueError(f"Heuristic index `{heuristic}` is not found!")
 
@@ -139,6 +147,9 @@ def run_environment(
         str(env.env.launch_power_dbm), 
         str(env.env.load) + "_nw_cnr_nobel-eu.csv"
     ])
+
+    # Crie o diretório se não existir
+    os.makedirs(os.path.dirname(monitor_final_name), exist_ok=True)
 
     # Preparação do arquivo CSV
     with open(monitor_final_name, "wt", encoding="UTF-8") as file_handler:
@@ -188,6 +199,10 @@ def run_environment(
 
     print(f"\nFinalizado! Resultados salvos em: {monitor_final_name}")
 
+def starmap_helper(args):
+    """Helper function for multiprocessing starmap compatibility"""
+    return run_environment(*args)
+
 # ===================================================
 # Configuração de logging, semente e argumentos de entrada
 # ===================================================
@@ -209,20 +224,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=25,
+        default=5,
         help='Número de episódios a serem simulados (default: 5)'
     )
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=1000,
+        default=100000,
         help='Número de chegadas por episódio (default: 1000)'
     )
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=1,
-        default=15,
+        default=25,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -230,8 +244,8 @@ def parse_arguments() -> argparse.Namespace:
         '-hi', '--heuristic_index',
         type=int,
         default=1,
-        choices=[1, 2, 3, 4],
-        help='Índice da heurística (1: First Fit, 2: Lowest Spectrum, 3: Load Balancing Modulation, 4: Load Balancing Best Modulation)'
+        choices=[1, 2, 3, 4, 5],
+        help='Índice da heurística (1: First Fit, 2: Lowest Spectrum, 3: Load Balancing Modulation, 4: Load Balancing Best Modulation, 5: Prioridade Banda C então L)'
     )
     # Nome base para o arquivo CSV de monitoramento
     parser.add_argument(
@@ -240,6 +254,11 @@ def parse_arguments() -> argparse.Namespace:
         default='examples/jocn_benchmark_2024/results/load_episodes',
         help='Nome base para o arquivo CSV de monitoramento'
     )
+    parser.add_argument('-mb', '--bands', nargs='+', type=str, 
+                        default=['BandaC'],
+                        choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
+                        help='Especifica uma ou mais bandas para simular (ex: --bands BandaC BandaL BandaC+L).')
+    
     return parser.parse_args()
 
 # ===================================================
@@ -247,6 +266,20 @@ def parse_arguments() -> argparse.Namespace:
 # ===================================================
 def main():
     args = parse_arguments()
+
+    # Multi-band functionality: Add band specifications with physical parameters
+    band_specifications = {
+        "BandaC": {"frequency_start": 191.60e12, "num_spectrum_resources": 320,
+                   "attenuation": 0.191, "noise_figure": 5.5},
+        "BandaL": {"frequency_start": 185.83e12, "num_spectrum_resources": 320,
+                   "attenuation": 0.200, "noise_figure": 6},
+        "BandaS": {"frequency_start": 197.22e12, "num_spectrum_resources": 320, 
+                   "attenuation": 0.220, "noise_figure": 7},
+        "BandaC+L": [
+            {"name": "C", "start_thz": 191.60, "num_slots": 320, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+            {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+        ]
+    }
 
     # Definição das modulações (valores atualizados conforme exemplo do launch power)
     cur_modulations: Tuple[Modulation, ...] = (
@@ -297,72 +330,125 @@ def main():
     attenuation_db_km = 0.2
     default_noise_figure_db = 4.5
 
-    # Caminho da topologia
-    topology_path = "/home/talles/projects/optical-networking-gym/examples//topologies/nobel-eu.xml"
+    
+    topology_path = f"/home/lucashenrique/MeusProjetos/LEA/ONG/OpticalNetworkingGym/examples/topologies/nobel-eu.xml"
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
-
-    # Carregamento da topologia
-    topology = get_topology(
-        topology_path,      # Caminho do arquivo de topologia
-        None,               # Nome da topologia (ajustável se necessário)
-        cur_modulations,    # Tuple de modulações
-        80,                 # Comprimento máximo de span (km)
-        attenuation_db_km,  # Atenuação padrão (dB/km)
-        default_noise_figure_db,  # Figura de ruído padrão (dB)
-        5                   # Número de caminhos mais curtos a computar entre pares de nós
-    )
-
+        
+    band_specs = [
+        {"name": "C", "start_thz": 191.60, "num_slots": 320, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+        {"name": "S", "start_thz": 197.22, "num_slots": 320, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
+        {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+    ]
     # Parâmetros de simulação
     threads = args.threads
     bandwidth = 4e12
     frequency_start = 3e8 / 1565e-9
     frequency_slot_bandwidth = 12.5e9
-    bit_rates = (10, 40, 100, 400, 1000)
+    bit_rates = (48,120)
     margin = 0
 
-    launch_power = 1.0
+    launch_power = 9.0
 
     loads = get_loads(args.topology_file)
 
     strategies = list(range(1, 5))
 
+    
+    print(f"Bandas selecionadas para simulação: {args.bands}")
+    
     env_args = []
-    for current_load in loads:
-        for strategy in [1]:
-            for mensure in [[False,0], [True, 0]]:
-                sim_args = (
-                    args.num_episodes,              # n_eval_episodes
-                    strategy,                       # heuristic_index
-                    f"{args.monitor_file_name}_{strategy}",  # monitor_file_name base
-                    topology,                       # topology
-                    seed,                           # seed
-                    True,                           # allow_rejection
-                    current_load,                   # load (varia)
-                    args.episode_length,            # episode_length
-                    320,                            # num_spectrum_resources
-                    launch_power,                   # launch_power_dbm
-                    bandwidth,                      # bandwidth
-                    frequency_start,                # frequency_start
-                    frequency_slot_bandwidth,       # frequency_slot_bandwidth
-                    "discrete",                     # bit_rate_selection
-                    bit_rates,                      # bit_rates
-                    margin,                         # margin
-                    f"examples/jocn_benchmark_2024/results/load_services_{strategy}",  # file_name para serviços
-                    False,                          # measure_disruptions
-                    False,                # measure_disruptions (True/False)
-                    0,                # measure_disruptions (valor)
-                    False,                          # run observation
+    for band_name in args.bands:
+        if band_name == "BandaC+L":
+            band_specs = [
+                {"name": "C", "start_thz": 191.60, "num_slots": 320, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+                {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+            ]
+            topology = get_topology(
+                topology_path,
+                None,
+                cur_modulations,
+                100,
+                0.2,  # Atenuação default
+                4.5,  # NF default
+                5
+            )
+            for current_load in get_loads(args.topology_file):
+                run_environment(
+                    args.num_episodes,
+                    args.heuristic_index,
+                    f"{args.monitor_file_name}_{band_name}",
+                    topology,
+                    seed,
+                    True,
+                    current_load,
+                    args.episode_length,
+                    sum([spec["num_slots"] for spec in band_specs]),  # total slots
+                    launch_power,
+                    sum([spec["num_slots"] for spec in band_specs]) * frequency_slot_bandwidth,  # total bandwidth
+                    min([spec["start_thz"] for spec in band_specs]) * 1e12,  # menor freq de início
+                    frequency_slot_bandwidth,
+                    "discrete",
+                    bit_rates,
+                    margin,
+                    f"service_logs/load_services_{band_name}_{current_load}.csv",
+                    False,
+                    False,
+                    0,
+                    False,
+                    band_specs 
                 )
-                env_args.append(sim_args)
+        else:
+            # Simulação para banda única 
+            specs = band_specifications[band_name]
+            topology = get_topology(
+                topology_path,
+                None,
+                cur_modulations,
+                100,
+                specs["attenuation"],
+                specs["noise_figure"],
+                5
+            )
+            for current_load in get_loads(args.topology_file):
+                run_environment(
+                    args.num_episodes,
+                    args.heuristic_index,
+                    f"{args.monitor_file_name}_{band_name}",
+                    topology,
+                    seed,
+                    True,
+                    current_load,
+                    args.episode_length,
+                    specs["num_spectrum_resources"],
+                    launch_power,
+                    specs["num_spectrum_resources"] * frequency_slot_bandwidth,
+                    specs["frequency_start"],
+                    frequency_slot_bandwidth,
+                    "discrete",
+                    bit_rates,
+                    margin,
+                    f"service_logs/load_services_{band_name}_{current_load}.csv",
+                    False,
+                    False,
+                    0,
+                    False,
+                    [specs]  
+                )
 
     # Execução das simulações utilizando multiprocessing se houver mais de uma thread
-    print("Iniciando simulações...")
+    if not env_args:
+        print("Nenhuma simulação para executar. Verifique os argumentos.")
+        return
+        
+    print(f"Iniciando {len(env_args)} simulações em {threads} threads...")
+    
     if threads > 1:
         with Pool(processes=threads) as pool:
-            pool.starmap(run_environment, env_args)
+            list(tqdm(pool.imap_unordered(starmap_helper, env_args), 
+                     total=len(env_args), desc="Simulando Cargas/Bandas"))
     else:
-        for arg in env_args:
+        for arg in tqdm(env_args, desc="Simulando Cargas/Bandas"):
             run_environment(*arg)
 
     print("Todas as simulações foram executadas.")

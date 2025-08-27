@@ -676,3 +676,80 @@ def heuristic_mscl_sequential_simplified(env: Env) -> tuple[int, bool, bool]:
     if any_blocked_osnr and not any_blocked_resources:
         any_blocked_resources = False
     return sim_env.action_space.n - 1, any_blocked_resources, any_blocked_osnr
+
+def heuristic_priority_band_C_then_L(env: Env) -> tuple[int, bool, bool]:
+    """
+    Tenta alocar o serviço na banda C enquanto a ocupação for < 90%.
+    Se >= 90%, tenta na banda L.
+    """
+    sim_env = get_qrmsa_env(env)
+    source = sim_env.current_service.source
+    destination = sim_env.current_service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+
+    # Identifica os índices das bandas C e L
+    band_C_idx = None
+    band_L_idx = None
+    for idx, band in enumerate(getattr(sim_env, "bands", getattr(sim_env, "_bands", []))):
+        if band.name.upper() == "C":
+            band_C_idx = idx
+        elif band.name.upper() == "L":
+            band_L_idx = idx
+
+    def band_occupancy(band_idx):
+        # Calcula ocupação da banda (slots ocupados / total de slots)
+        total_slots = sim_env.bands[band_idx].num_slots
+        occupied = 0
+        for path in k_paths:
+            slots = sim_env.get_available_slots(path)[sim_env.bands[band_idx].offset : sim_env.bands[band_idx].offset + total_slots]
+            occupied += total_slots - np.sum(slots)
+        # Média de ocupação entre todos os caminhos
+        return occupied / (total_slots * len(k_paths))
+
+    # Decide se tenta na banda C ou L
+    if band_C_idx is not None and band_occupancy(band_C_idx) < 0.9:
+        result = try_allocate_in_band(sim_env, k_paths, band_C_idx)
+        if result is not None:
+            return result
+
+    # Se ocupação >= 90% ou não conseguiu, tenta na banda L
+    if band_L_idx is not None:
+        result = try_allocate_in_band(sim_env, k_paths, band_L_idx)
+        if result is not None:
+            return result
+
+    # Se não conseguir em nenhuma, retorna ação de rejeição
+    return env.action_space.n - 1, True, True
+
+def try_allocate_in_band(sim_env, k_paths, band_idx):
+    for path_idx, path in enumerate(k_paths):
+        for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[modulation_idx]
+            required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+            if required_slots <= 0:
+                continue
+            offset = sim_env.bands[band_idx].offset
+            num_slots = sim_env.bands[band_idx].num_slots
+            available_slots = sim_env.get_available_slots(path)[offset:offset+num_slots]
+            valid_starts = sim_env._get_candidates(available_slots, required_slots, num_slots)
+            if not valid_starts:
+                continue
+            candidate_start = valid_starts[0]
+            service = sim_env.current_service
+            service.path = path
+            service.initial_slot = candidate_start + offset
+            service.number_slots = required_slots
+            service.current_modulation = modulation
+            service.center_frequency = (
+                sim_env.bands[band_idx].frequency_start +
+                (sim_env.frequency_slot_bandwidth * candidate_start) +
+                (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+            )
+            service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+            service.launch_power = sim_env.launch_power
+            osnr, _, _ = calculate_osnr(sim_env, service)
+            threshold = modulation.minimum_osnr + sim_env.margin
+            if osnr >= threshold:
+                action_index = get_action_index(sim_env, path_idx, modulation_idx, service.initial_slot)
+                return action_index, False, False
+    return None
