@@ -5,6 +5,8 @@ cimport cython
 cimport numpy as cnp
 from libc.stdint cimport uint32_t
 from libc.math cimport log, exp, asinh, log10
+from libc.stdlib cimport malloc, free
+from libc.string cimport memset, memcpy
 cnp.import_array()
 
 import gymnasium as gym
@@ -16,7 +18,7 @@ import random
 import numpy as np
 from collections import defaultdict
 from numpy.random import SeedSequence
-from optical_networking_gym.utils import rle
+from optical_networking_gym.utils import rle, link_shannon_entropy_, fragmentation_route_cuts, fragmentation_route_rss
 from optical_networking_gym.core.osnr import calculate_osnr, calculate_osnr_observation
 import math
 import typing
@@ -25,6 +27,50 @@ from scipy.signal import convolve
 
 if typing.TYPE_CHECKING:
     from optical_networking_gym.topology import Link, Span, Modulation, Path
+
+cdef class LinkCacheManager:
+    cdef dict _cache
+    cdef object topology
+    
+    def __init__(self, topology):
+        self.topology = topology
+        self._cache = {}
+        self._initialize_cache()
+    
+    cdef void _initialize_cache(self):
+        for edge in self.topology.edges():
+            key = (edge[0], edge[1])
+            edge_data = self.topology[edge[0]][edge[1]]
+            self._cache[key] = {
+                'index': edge_data.get('index', 0),
+                'services': edge_data.get('services', []),
+                'running_services': edge_data.get('running_services', []),
+                'utilization': edge_data.get('utilization', 0.0),
+                'last_update': edge_data.get('last_update', 0.0),
+                'external_fragmentation': edge_data.get('external_fragmentation', 0.0),
+                'compactness': edge_data.get('compactness', 0.0)
+            }
+    
+    cdef dict get_link_data(self, str node1, str node2):
+        key = (node1, node2)
+        if key not in self._cache:
+            key = (node2, node1)
+        return self._cache[key]
+    
+    cdef void update_link_services(self, str node1, str node2, object service, bint add=True):
+        key = (node1, node2)
+        if key not in self._cache:
+            key = (node2, node1)
+        
+        if add:
+            self._cache[key]['services'].append(service)
+            self._cache[key]['running_services'].append(service)
+            self.topology[node1][node2]['services'].append(service)
+            self.topology[node1][node2]['running_services'].append(service)
+        else:
+            if service in self._cache[key]['running_services']:
+                self._cache[key]['running_services'].remove(service)
+                self.topology[node1][node2]['running_services'].remove(service)
 
 cdef class Service:
     cdef public int service_id
@@ -140,6 +186,7 @@ cdef class QRMSAEnv:
     cdef public double frequency_slot_bandwidth
     cdef public double margin
     cdef public object modulations
+    cdef public str qot_constraint
     cdef bint measure_disruptions
     cdef public object _np_random
     cdef public int _np_random_seed
@@ -188,6 +235,11 @@ cdef class QRMSAEnv:
     cdef int bl_resource 
     cdef int bl_osnr 
     cdef int bl_reject
+
+    cdef LinkCacheManager link_cache
+    cdef dict modulation_slots_cache
+    cdef cnp.int64_t[:, :] topology_indices_cache  
+    cdef dict path_nodes_cache 
     cdef public int max_modulation_idx
     cdef public int modulations_to_consider
     cdef int spectrum_efficiency_metric
@@ -231,6 +283,7 @@ cdef class QRMSAEnv:
         defragmentation: bool = False,
         n_defrag_services: int = 0,
         gen_observation: bool = True,
+        qot_constraint: str = "ASE+NLI",
     ):
         self.gen_observation = gen_observation
         self.defragmentation = defragmentation
@@ -287,6 +340,7 @@ cdef class QRMSAEnv:
         self.frequency_start = frequency_start
         self.frequency_slot_bandwidth = frequency_slot_bandwidth
         self.margin = margin
+        self.qot_constraint = qot_constraint
         self.measure_disruptions = measure_disruptions
         self.frequency_end = self.frequency_start + (self.frequency_slot_bandwidth * self.num_spectrum_resources)
         assert math.isclose(self.frequency_end - self.frequency_start, self.bandwidth, rel_tol=1e-5)
@@ -312,7 +366,6 @@ cdef class QRMSAEnv:
         self.disrupted_services = 0
         self.episode_disrupted_services = 0
 
-        # Redefinir o espaço de ações para Discrete
         self.action_space = gym.spaces.Discrete(
             (self.k_paths * self.modulations_to_consider * self.num_spectrum_resources)+1
         )
@@ -408,8 +461,32 @@ cdef class QRMSAEnv:
         self.spectrum_efficiency_metric = 0
         self.episode_defrag_cicles = 0
         self.episode_service_realocations = 0
+        
+        self.link_cache = LinkCacheManager(self.topology)
+        self.modulation_slots_cache = {}
+        self.path_nodes_cache = {}
+        self._initialize_optimization_caches()
+        
         if reset:
             self.reset()
+
+    cdef void _initialize_optimization_caches(self):
+        """Inicializa caches para otimizações de performance"""
+        if hasattr(self, 'bit_rates') and hasattr(self, 'modulations'):
+            for modulation in self.modulations:
+                for bit_rate in self.bit_rates:
+                    key = (modulation.spectral_efficiency, bit_rate)
+                    bandwidth_required = bit_rate / modulation.spectral_efficiency
+                    number_slots = int(np.ceil(bandwidth_required / self.frequency_slot_bandwidth * 1e9))
+                    self.modulation_slots_cache[key] = number_slots
+
+        if hasattr(self, 'k_shortest_paths'):
+            for source_dest_key, paths in self.k_shortest_paths.items():
+                if len(source_dest_key) == 2: 
+                    source, destination = source_dest_key
+                    for i, path in enumerate(paths):
+                        cache_key = (source, destination, i)
+                        self.path_nodes_cache[cache_key] = list(path.node_list)
 
     cpdef tuple reset(self, object seed=None, dict options=None):
         self.episode_bit_rate_requested = 0.0
@@ -459,6 +536,7 @@ cdef class QRMSAEnv:
         self.topology.graph["running_services"] = []
         self.topology.graph["last_update"] = 0.0
 
+        self.link_cache._initialize_cache()
         for lnk in self.topology.edges():
             self.topology[lnk[0]][lnk[1]]["utilization"] = 0.0
             self.topology[lnk[0]][lnk[1]]["last_update"] = 0.0
@@ -491,28 +569,13 @@ cdef class QRMSAEnv:
         return observation, info
     
     cpdef public normalize_value(self, value, min_v, max_v):
-        """
-        Normaliza um valor no intervalo [0,1]. 
-        Se max_v == min_v, retorna 0 para evitar divisão por zero.
-        """
+
         if max_v == min_v:
             return 0.0
         return (value - min_v) / (max_v - min_v)
     
     cpdef public _get_candidates(self, available_slots, num_slots_required, total_slots):
-        """
-        Gera todos os candidatos (initial slot) para alocação, usando RLE.
-        Se o bloco se estende até o final, não exige guard band; caso contrário,
-        exige num_slots_required+1 slots.
-        
-        Args:
-            available_slots (np.array): Vetor com slots disponíveis (1) e indisponíveis (0).
-            num_slots_required (int): Número de slots necessários para o serviço.
-            total_slots (int): Número total de slots no espectro.
-        
-        Returns:
-            list: Lista de candidatos (índices) válidos.
-        """
+
         initial_indices, values, lengths = rle(available_slots)
         candidates = []
         for start, val, length in zip(initial_indices, values, lengths):
@@ -528,10 +591,6 @@ cdef class QRMSAEnv:
         return candidates
 
     cpdef public get_max_modulation_index(self):
-        """
-        Atualiza self.max_modulation_idx com a melhor modulação (maior índice) cuja alocação
-        apresenta OSNR aceitável (>= limiar + margin). Usa a mesma lógica de geração de candidatos.
-        """
         for path in self.k_shortest_paths[self.current_service.source, self.current_service.destination]:
             available_slots = self.get_available_slots(path)
             
@@ -552,7 +611,11 @@ cdef class QRMSAEnv:
                         self.current_service.launch_power = self.launch_power
                         self.current_service.blocked_due_to_resources = False
 
-                        osnr, _, _ = calculate_osnr(self, self.current_service)
+                        if self.qot_constraint == "DIST":
+                            qot_acceptable = path.length <= modulation.maximum_length
+                        else:
+                            osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                            qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
                         
                         self.current_service.path = None
                         self.current_service.initial_slot = -1
@@ -561,7 +624,7 @@ cdef class QRMSAEnv:
                         self.current_service.bandwidth = 0.0
                         self.current_service.launch_power = 0.0
 
-                        if osnr >= modulation.minimum_osnr + self.margin:
+                        if qot_acceptable:
                             self.max_modulation_idx = max(len(self.modulations) - idm - 1,
                                                         self.modulations_to_consider - 1)
                             return
@@ -710,7 +773,7 @@ cdef class QRMSAEnv:
                 mod_features_cache[(p_idx, m_idx)] = (valid_starts, features, num_slots_required, modulation)
 
         # ========================
-        # Geração da máscara de ações (permanece inalterada)
+        # Geração da máscara de ações
         # ========================
         total_actions = num_paths_to_evaluate * num_mod_to_consider * num_spectrum_resources
         action_mask = np.zeros(total_actions + 1, dtype=np.uint8)
@@ -782,42 +845,27 @@ cdef class QRMSAEnv:
         else:
             allowed_mods = list(range(0, self.modulations_to_consider))
         array[1] = allowed_mods[array[1]]
-        # print(f"k:{self.k_shortest_paths[self.current_service.source,self.current_service.destination][array[0]]}, mod: {self.modulations[array[1]]}, slot: {array[2]}")
         return array
 
     cpdef encoded_decimal_to_array(self, decimal: int, max_values=None):
-        # Usa divisão inteira para garantir um valor inteiro para part_size.
         part_size = self.num_spectrum_resources // self.modulations_to_consider  
-        mod_idx = decimal // part_size  # Calculado mas não usado para modulação
-        # print(f"Input decimal: {decimal}")
+        mod_idx = decimal // part_size  
         
         if max_values is None:
-            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]
-        # print(f"Max values: {max_values}")
-        
+            max_values = [self.k_paths, self.modulations_to_consider, self.num_spectrum_resources]        
         array = []
-        # Decomposição do número decimal com base nos valores máximos (ordem: [k_path, modulação, slot])
         for max_val in reversed(max_values):
             digit = decimal % max_val
-            # print(f"Current max_val: {max_val}, digit: {digit}")
             array.insert(0, digit)
             decimal //= max_val
-            # print(f"Updated decimal: {decimal}")
-        
-        # Cria a lista de modulações permitidas
+
         if self.max_modulation_idx > 1:
-            # Remove o 'reversed' para manter a ordem desejada: maior para menor.
+
             allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - self.modulations_to_consider, -1))
         else:
             allowed_mods = list(reversed(list(range(0, self.modulations_to_consider))))
-        # print(f"Allowed mods: {allowed_mods}")
-        
-        # Atualiza o dígito de modulação usando o dígito extraído da decomposição
-        array[1] = allowed_mods[array[1]]
-        # print(f"Decoded array: {array}")
-        # print(f"k: {self.k_shortest_paths[self.current_service.source, self.current_service.destination][array[0]]}, "
-        #     f"mod: {self.modulations[array[1]]}, slot: {array[2]}")
-        
+
+        array[1] = allowed_mods[array[1]]        
         return array
 
 
@@ -841,6 +889,7 @@ cdef class QRMSAEnv:
         cdef object path = None
         cdef list services_to_measure = []
         cdef dict info
+        cdef dict link_data
 
         self.current_service.blocked_due_to_resources = False
         self.current_service.blocked_due_to_osnr = False
@@ -881,9 +930,18 @@ cdef class QRMSAEnv:
                 self.current_service.bandwidth = self.frequency_slot_bandwidth * number_slots
                 self.current_service.launch_power = self.launch_power
 
-                osnr, ase, nli = calculate_osnr(self, self.current_service)
+                if self.qot_constraint == "DIST":
+                    path_distance = self.current_service.path.length
+                    qot_acceptable = path_distance <= modulation.maximum_length
+                    osnr = 0.0 if qot_acceptable else -1.0
+                    ase = 0.0
+                    nli = 0.0
+                else:
+                    path_distance = self.current_service.path.length  # For error message
+                    osnr, ase, nli = calculate_osnr(self, self.current_service, self.qot_constraint)
+                    qot_acceptable = osnr >= osnr_req
 
-                if osnr >= osnr_req:
+                if qot_acceptable:
                     self.current_service.accepted = True
                     self.current_service.OSNR = osnr
                     self.current_service.ASE = ase
@@ -898,10 +956,17 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
-                    raise ValueError(
-                        f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
-                        f"with modulation {modulation}, and osnr_req {osnr_req}."
-                    )
+                    if self.qot_constraint == "DIST":
+                        raise ValueError(
+                            f"Path distance {path_distance:.2f} km is greater than maximum length "
+                            f"{modulation.maximum_length} km for service {self.current_service.service_id} "
+                            f"with modulation {modulation}."
+                        )
+                    else:
+                        raise ValueError(
+                            f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
+                            f"with modulation {modulation}, and osnr_req {osnr_req}."
+                        )
                     self.current_service.accepted = False
                     self.current_service.blocked_due_to_osnr = True
                     self.bl_osnr += 1
@@ -916,15 +981,26 @@ cdef class QRMSAEnv:
 
         if self.measure_disruptions and self.current_service.accepted:
             services_to_measure = []
+            
             for link in self.current_service.path.links:
-                for service_in_link in self.topology[link.node1][link.node2]["running_services"]:
+                link_data = self.link_cache.get_link_data(link.node1, link.node2)
+                running_services = link_data['running_services']
+                
+                for service_in_link in running_services:
                     if (service_in_link not in services_to_measure
                             and service_in_link not in self.disrupted_services_list):
                         services_to_measure.append(service_in_link)
 
             for svc in services_to_measure:
-                osnr_svc, ase_svc, nli_svc = calculate_osnr(self, svc)
-                if osnr_svc < svc.current_modulation.minimum_osnr:
+                if self.qot_constraint == "DIST":
+                    path_distance = svc.path.length
+                    qot_acceptable = path_distance <= svc.current_modulation.maximum_length
+                    osnr_svc = 0.0 if qot_acceptable else -1.0
+                else:
+                    osnr_svc, ase_svc, nli_svc = calculate_osnr(self, svc, self.qot_constraint)
+                    qot_acceptable = osnr_svc >= svc.current_modulation.minimum_osnr
+                
+                if not qot_acceptable:
                     disrupted_services += 1
                     if svc not in self.disrupted_services_list:
                         self.disrupted_services += 1
@@ -972,7 +1048,7 @@ cdef class QRMSAEnv:
         if not action == (self.action_space.n - 1):
             reward = self.reward()
         else:
-            reward = -6.0
+            reward = -3.0
         info = {
             "episode_services_accepted": self.episode_services_accepted,
             "service_blocking_rate": 0.0,
@@ -988,6 +1064,39 @@ cdef class QRMSAEnv:
             "episode_defrag_cicles": self.episode_defrag_cicles,
             "episode_service_realocations": self.episode_service_realocations,
         }
+        # Verificar se isso vai se manter após o paper
+        # Calculate current fragmentation metrics
+        if len(self.topology.graph["running_services"]) > 0:
+            # Get available slots for all links
+            available_slots_matrix = []
+            for n1, n2 in self.topology.edges():
+                link_index = self.topology[n1][n2]["index"]
+                available_slots = self.topology.graph["available_slots"][link_index, :].tolist()
+                available_slots_matrix.append(available_slots)
+            
+            # Calculate fragmentation metrics
+            if available_slots_matrix:
+                # Shannon entropy (average across all links)
+                entropies = [link_shannon_entropy_(row) for row in available_slots_matrix]
+                shannon_entropy_avg = sum(entropies) / len(entropies) if entropies else 0.0
+                
+                # Route cuts (total across all links)
+                route_cuts_total = fragmentation_route_cuts(available_slots_matrix)
+                
+                # Route RSS 
+                route_rss = fragmentation_route_rss(available_slots_matrix)
+                
+                info["fragmentation_shannon_entropy"] = shannon_entropy_avg
+                info["fragmentation_route_cuts"] = route_cuts_total
+                info["fragmentation_route_rss"] = route_rss
+            else:
+                info["fragmentation_shannon_entropy"] = 0.0
+                info["fragmentation_route_cuts"] = 0
+                info["fragmentation_route_rss"] = 0.0
+        else:
+            info["fragmentation_shannon_entropy"] = 0.0
+            info["fragmentation_route_cuts"] = 0
+            info["fragmentation_route_rss"] = 0.0
 
         if self.services_processed > 0:
             info["service_blocking_rate"] = float(
@@ -1165,10 +1274,21 @@ cdef class QRMSAEnv:
 
             return cur_spectrum_compactness
 
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
     cpdef int get_number_slots(self, object service, object modulation):
-            cdef double required_slots
-            required_slots = service.bit_rate / (modulation.spectral_efficiency * self.channel_width)
-            return int(math.ceil(required_slots))
+        cdef double required_slots
+        cdef tuple cache_key
+        
+        cache_key = (modulation.spectral_efficiency, service.bit_rate)
+        if cache_key in self.modulation_slots_cache:
+            return self.modulation_slots_cache[cache_key]
+        
+        required_slots = service.bit_rate / (modulation.spectral_efficiency * self.channel_width)
+        cdef int result = int(math.ceil(required_slots))
+        
+        self.modulation_slots_cache[cache_key] = result
+        return result
 
 
     cpdef public is_path_free(self, path, initial_slot: int, number_slots: int):
@@ -1217,6 +1337,7 @@ cdef class QRMSAEnv:
         cdef int end_slot = start_slot + number_slots
         cdef tuple node_list = path.get_node_list() 
         cdef object link  
+        cdef dict link_data
 
         if end_slot < self.num_spectrum_resources:
             end_slot+=1
@@ -1224,8 +1345,11 @@ cdef class QRMSAEnv:
             raise ValueError("End slot is greater than the number of spectrum resources.")
             
         path_length = len(node_list)
+        
         for i in range(path_length - 1):
-            link_index = self.topology[node_list[i]][node_list[i + 1]]["index"]
+            link_data = self.link_cache.get_link_data(node_list[i], node_list[i + 1])
+            link_index = link_data['index']
+            
             self.topology.graph["available_slots"][
                 link_index,
                 start_slot:end_slot
@@ -1236,8 +1360,12 @@ cdef class QRMSAEnv:
                 start_slot:end_slot
             ] = self.current_service.service_id
 
-            self.topology[node_list[i]][node_list[i + 1]]["services"].append(self.current_service)
-            self.topology[node_list[i]][node_list[i + 1]]["running_services"].append(self.current_service)
+            self.link_cache.update_link_services(
+                node_list[i], 
+                node_list[i + 1], 
+                self.current_service, 
+                add=True
+            )
 
         self.topology.graph["running_services"].append(self.current_service)
 
@@ -1270,22 +1398,35 @@ cdef class QRMSAEnv:
         heapq.heappush(self._events, (release_time, service.service_id, service))
     
     cpdef public _release_path(self, service: Service):
+        cdef int i, link_index, start_slot, end_slot
+        cdef dict link_data
+        
+        start_slot = service.initial_slot
+        end_slot = service.initial_slot + service.number_slots + 1
+        
         for i in range(len(service.path.node_list) - 1):
+            link_data = self.link_cache.get_link_data(
+                service.path.node_list[i], 
+                service.path.node_list[i + 1]
+            )
+            link_index = link_data['index']
+            
             self.topology.graph["available_slots"][
-                self.topology[service.path.node_list[i]][service.path.node_list[i + 1]][
-                    "index"
-                ],
-                service.initial_slot : service.initial_slot + service.number_slots+1,
+                link_index,
+                start_slot:end_slot,
             ] = 1
+            
             self.spectrum_slots_allocation[
-                self.topology[service.path.node_list[i]][service.path.node_list[i + 1]][
-                    "index"
-                ],
-                service.initial_slot : service.initial_slot + service.number_slots+1,
+                link_index,
+                start_slot:end_slot,
             ] = -1
-            self.topology[service.path.node_list[i]][service.path.node_list[i + 1]][
-                "running_services"
-            ].remove(service)
+            
+            self.link_cache.update_link_services(
+                service.path.node_list[i], 
+                service.path.node_list[i + 1], 
+                service, 
+                add=False
+            )
 
         self.topology.graph["running_services"].remove(service)
 
@@ -1419,22 +1560,25 @@ cdef class QRMSAEnv:
 
         link["last_update"] = self.current_time
 
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
     cpdef cnp.ndarray get_available_slots(self, object path):
         cdef Py_ssize_t i, n
         cdef tuple node_list = path.node_list
-        cdef list indices
         cdef cnp.ndarray available_slots_matrix
         cdef cnp.ndarray product
         cdef int[:, :] slots_view
         cdef int[:] product_view
         cdef Py_ssize_t num_rows, num_cols
+        cdef dict link_data
 
         n = len(node_list) - 1
 
-        indices = [0] * n
+        cdef cnp.ndarray[cnp.int64_t, ndim=1] indices = np.empty(n, dtype=np.int64)
 
         for i in range(n):
-            indices[i] = self.topology[node_list[i]][node_list[i + 1]]["index"]
+            link_data = self.link_cache.get_link_data(node_list[i], node_list[i + 1])
+            indices[i] = link_data['index']
 
         available_slots_matrix = self.topology.graph["available_slots"][indices, :]
 
@@ -1445,6 +1589,7 @@ cdef class QRMSAEnv:
 
         product = available_slots_matrix[0].copy()
         product_view = product
+
         for i in range(1, num_rows):
             for j in range(num_cols):
                 product_view[j] *= slots_view[i, j]
@@ -1471,17 +1616,23 @@ cdef class QRMSAEnv:
 
 
     cpdef list _get_spectrum_slots(self, int path):
+        cdef dict link_data
+        cdef int link_index
+        
         spectrum_route = []
         for link in self.k_shortest_paths[
             self.current_service.source, 
             self.current_service.destination
         ][path].links:
-            link_index = self.topology[link.node1][link.node2]["index"]
+            link_data = self.link_cache.get_link_data(link.node1, link.node2)
+            link_index = link_data['index']
             spectrum_route.append(self.topology.graph["available_slots"][link_index, :])
 
         return spectrum_route
 
 
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
     cpdef defragment(self, int num_services):
         self.episode_defrag_cicles += 1
         if num_services == 0:
@@ -1489,96 +1640,134 @@ cdef class QRMSAEnv:
 
         cdef int moved = 0
         cdef Service service
-        cdef int number_slots, candidate, i, path_length, link_index, start_slot, end_slot
+        cdef int number_slots, candidate, i, path_length, link_index
+        cdef int start_slot, end_slot, old_start_slot, old_end_slot
         cdef object path, candidates
         cdef cnp.ndarray available_slots
         cdef tuple node_list
+        cdef dict link_data
 
         cdef list active_services = list(self.topology.graph["running_services"])
-        
+
         cdef int old_initial_slot = 0
-        cdef double old_center_frequency =0.0
+        cdef double old_center_frequency = 0.0
         cdef double old_bandwidth = 0.0
-
+        cdef double osnr, ase, nli
+        
         for service in active_services:
-
+            if moved >= num_services:
+                break
+            
             old_initial_slot = service.initial_slot
             old_center_frequency = service.center_frequency
             old_bandwidth = service.bandwidth
-            
-            if moved >= num_services:
-                break
 
             path = service.path
             number_slots = service.number_slots
+            node_list = path.get_node_list()
+            path_length = len(node_list)
+
+            old_start_slot = old_initial_slot
+            old_end_slot = old_initial_slot + number_slots
+            if old_end_slot < self.num_spectrum_resources:
+                old_end_slot += 1
+
+            # Temporary release
+            for i in range(path_length - 1):
+                link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                link_index = link_data['index']
+                self.topology.graph["available_slots"][link_index, old_start_slot:old_end_slot] = 1
+                self.spectrum_slots_allocation[link_index, old_start_slot:old_end_slot] = -1
+
             available_slots = self.get_available_slots(path)
             candidates = self._get_candidates(available_slots, number_slots, self.num_spectrum_resources)
 
             if not candidates:
+
+                for i in range(path_length - 1):
+                    link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                    link_index = link_data['index']
+                    self.topology.graph["available_slots"][link_index, old_start_slot:old_end_slot] = 0
+                    self.spectrum_slots_allocation[link_index, old_start_slot:old_end_slot] = service.service_id
                 continue
 
+            best_candidate = None
             for candidate in candidates:
+                if candidate < service.initial_slot:
+                    best_candidate = candidate
+                    break
 
-                if candidate >= service.initial_slot:
-                    continue
+            if best_candidate is None:
+                for i in range(path_length - 1):
+                    link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                    link_index = link_data['index']
+                    self.topology.graph["available_slots"][link_index, old_start_slot:old_end_slot] = 0
+                    self.spectrum_slots_allocation[link_index, old_start_slot:old_end_slot] = service.service_id
+                continue
 
-                start_slot = candidate
-                end_slot = start_slot + number_slots
-                if end_slot < self.num_spectrum_resources:
-                    end_slot += 1
-                elif end_slot > self.num_spectrum_resources:
-                    continue  
-
-                service.initial_slot = start_slot
-                service.center_frequency = self.frequency_start + (
-                    self.frequency_slot_bandwidth * start_slot
-                ) + (
-                    self.frequency_slot_bandwidth * (number_slots / 2.0)
-                )
-                service.bandwidth = self.frequency_slot_bandwidth * number_slots
-                service.launch_power = self.launch_power
-
-                osnr, ase, nli = calculate_osnr(self, service)
-                if osnr < service.current_modulation.minimum_osnr:
-                    service.initial_slot = old_initial_slot
-                    service.center_frequency = old_center_frequency
-                    service.bandwidth = old_bandwidth
-                    continue
-
-
-
-                node_list = path.get_node_list()
-                path_length = len(node_list)
+            start_slot = best_candidate
+            end_slot = start_slot + number_slots
+            if end_slot < self.num_spectrum_resources:
+                end_slot += 1
+            elif end_slot > self.num_spectrum_resources:
 
                 for i in range(path_length - 1):
-                    link_index = self.topology[node_list[i]][node_list[i+1]]["index"]
-                    self.topology.graph["available_slots"][link_index,
-                        old_initial_slot : old_initial_slot + number_slots + 1] = 1
-                    self.spectrum_slots_allocation[link_index,
-                        old_initial_slot : old_initial_slot + number_slots + 1] = -1
-                    if service in self.topology[node_list[i]][node_list[i+1]]["running_services"]:
-                        self.topology[node_list[i]][node_list[i+1]]["running_services"].remove(service)
+                    link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                    link_index = link_data['index']
+                    self.topology.graph["available_slots"][link_index, old_start_slot:old_end_slot] = 0
+                    self.spectrum_slots_allocation[link_index, old_start_slot:old_end_slot] = service.service_id
+                continue
 
 
+            # Update service for OSNR test
+            service.initial_slot = start_slot
+            service.center_frequency = self.frequency_start + (
+                self.frequency_slot_bandwidth * start_slot
+            ) + (
+                self.frequency_slot_bandwidth * (number_slots / 2.0)
+            )
+            service.bandwidth = self.frequency_slot_bandwidth * number_slots
+            service.launch_power = self.launch_power
+
+            if self.qot_constraint == "DIST":
+                path_distance = service.path.length
+                qot_acceptable = path_distance <= service.current_modulation.maximum_length
+                osnr = 0.0 if qot_acceptable else -1.0
+                ase = 0.0
+                nli = 0.0
+            else:
+                osnr, ase, nli = calculate_osnr(self, service, self.qot_constraint)
+                osnr_required = service.current_modulation.minimum_osnr
+                qot_acceptable = osnr >= osnr_required
+            
+            if not qot_acceptable:
+                service.initial_slot = old_initial_slot
+                service.center_frequency = old_center_frequency
+                service.bandwidth = old_bandwidth
+                
+                # Restore original allocation
                 for i in range(path_length - 1):
-                    link_index = self.topology[node_list[i]][node_list[i+1]]["index"]
-                    self.topology.graph["available_slots"][link_index, start_slot:end_slot] = 0
-                    self.spectrum_slots_allocation[link_index, start_slot:end_slot] = service.service_id
-                    self.topology[node_list[i]][node_list[i+1]]["services"].append(service)
-                    self.topology[node_list[i]][node_list[i+1]]["running_services"].append(service)
+                    link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                    link_index = link_data['index']
+                    self.topology.graph["available_slots"][link_index, old_start_slot:old_end_slot] = 0
+                    self.spectrum_slots_allocation[link_index, old_start_slot:old_end_slot] = service.service_id
+                continue
 
-                service.OSNR = osnr
-                service.ASE = ase
-                service.NLI = nli
+            # Confirm new allocation
+            for i in range(path_length - 1):
+                link_data = self.link_cache.get_link_data(node_list[i], node_list[i+1])
+                link_index = link_data['index']
+                self.topology.graph["available_slots"][link_index, start_slot:end_slot] = 0
+                self.spectrum_slots_allocation[link_index, start_slot:end_slot] = service.service_id
 
-                moved += 1
-                self.episode_service_realocations += 1
+            service.OSNR = osnr
+            service.ASE = ase
+            service.NLI = nli
 
-                break
-
+            moved += 1
+            self.episode_service_realocations += 1
+        
         return
-
-
 
     cpdef public close(self):
         return super().close()

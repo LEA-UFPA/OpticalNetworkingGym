@@ -157,7 +157,7 @@ def heuristic_from_mask(env: Env, mask: np.ndarray) -> int:
         service.launch_power = qrmsa_env.launch_power
 
         # Calcula o OSNR e valida
-        osnr, _, _ = calculate_osnr(qrmsa_env, service)
+        osnr, _, _ = calculate_osnr(qrmsa_env, service, qrmsa_env.qot_constraint)
         # print(f"OSNR calculado para ação {action_index}: {osnr:.2f}")
 
         threshold = modulation.minimum_osnr + qrmsa_env.margin
@@ -230,7 +230,17 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
             service.launch_power = sim_env.launch_power
             
-            osnr, _, _ = calculate_osnr(sim_env, service)
+            # Check QoT constraint
+            if sim_env.qot_constraint == "DIST":
+                path_distance = path.length
+                qot_acceptable = path_distance <= modulation.maximum_length
+                if not qot_acceptable:
+                    blocked_due_to_osnr = True
+                    continue
+                osnr = 20.0  # Dummy value for DIST constraint
+            else:
+                osnr, _, _ = calculate_osnr(sim_env, service, sim_env.qot_constraint)
+            
             threshold = modulation.minimum_osnr + sim_env.margin
             if osnr >= threshold:
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
@@ -283,7 +293,17 @@ def heuristic_highest_snr(env: Env) -> int:
                 service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
                 service.launch_power = sim_env.launch_power
 
-                osnr, _, _ = calculate_osnr(sim_env, service)
+                # Check QoT constraint
+                if sim_env.qot_constraint == "DIST":
+                    path_distance = path.length
+                    qot_acceptable = path_distance <= modulation.maximum_length
+                    if not qot_acceptable:
+                        any_blocked_osnr = True
+                        continue
+                    osnr = 20.0  # Dummy value for DIST constraint
+                else:
+                    osnr, _, _ = calculate_osnr(sim_env, service, sim_env.qot_constraint)
+                
                 threshold = modulation.minimum_osnr + sim_env.margin
 
                 if osnr >= threshold:
@@ -369,7 +389,17 @@ def heuristic_lowest_fragmentation(env: Env) -> tuple[int, bool, bool]:
                 service.bandwidth    = sim_env.frequency_slot_bandwidth * req_slots
                 service.launch_power = sim_env.launch_power
 
-                osnr, _, _ = calculate_osnr(sim_env, service)
+                # Check QoT constraint
+                if sim_env.qot_constraint == "DIST":
+                    path_distance = path.length
+                    qot_acceptable = path_distance <= modulation.maximum_length
+                    if not qot_acceptable:
+                        any_blocked_osnr = True
+                        continue
+                    osnr = 20.0  # Dummy value for DIST constraint
+                else:
+                    osnr, _, _ = calculate_osnr(sim_env, service, sim_env.qot_constraint)
+                
                 if osnr < modulation.minimum_osnr + sim_env.margin:
                     any_blocked_osnr = True
                     continue
@@ -450,14 +480,20 @@ def shortest_available_path_lowest_spectrum_best_modulation(
                 qrmsa_env.current_service.bandwidth = qrmsa_env.frequency_slot_bandwidth * number_slots
                 qrmsa_env.current_service.launch_power = qrmsa_env.launch_power
 
-                # Calcular OSNR
-                osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service)
-                if osnr >= modulation.minimum_osnr + qrmsa_env.margin:
-                    # Converter para índice de ação
-                    action = get_action_index(qrmsa_env, idp, idm, initial_slot)
-                    return action, False, False  # ou uma ação padrão específica
+                # Check QoT constraint
+                if qrmsa_env.qot_constraint == "DIST":
+                    path_distance = path.length
+                    qot_acceptable = path_distance <= modulation.maximum_length
+                    if not qot_acceptable:
+                        continue
+                    osnr = 0.0  # Dummy value for DIST constraint
+                else:
+                    # Calcular OSNR
+                    osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service, qrmsa_env.qot_constraint)                    
+                    if osnr >= modulation.minimum_osnr + qrmsa_env.margin:
+                        action = get_action_index(qrmsa_env, idp, idm, initial_slot)
+                        return action, False, False 
 
-    # Se nenhuma ação válida encontrada, retornar a ação de rejeição se permitido
     return qrmsa_env.reject_action, False, False  # ou uma ação padrão específica
 
 def best_modulation_load_balancing(
@@ -506,8 +542,17 @@ def best_modulation_load_balancing(
                 qrmsa_env.current_service.bandwidth = qrmsa_env.frequency_slot_bandwidth * number_slots
                 qrmsa_env.current_service.launch_power = qrmsa_env.launch_power
 
-                # Calcular OSNR
-                osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service)
+                # Check QoT constraint
+                if qrmsa_env.qot_constraint == "DIST":
+                    path_distance = path.length
+                    qot_acceptable = path_distance <= modulation.maximum_length
+                    if not qot_acceptable:
+                        continue
+                    osnr = 20.0  # Dummy value for DIST constraint
+                else:
+                    # Calcular OSNR
+                    osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service, qrmsa_env.qot_constraint)
+                
                 if osnr >= modulation.minimum_osnr + qrmsa_env.margin:
                     # Converter para índice de ação
                     action = get_action_index(qrmsa_env, idp, idm, initial_slot)
@@ -571,7 +616,15 @@ def load_balancing_best_modulation(
                 qrmsa_env.current_service.launch_power = qrmsa_env.launch_power
 
                 # Calcular OSNR
-                osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service)
+                # Para DIST constraint, verificar se o caminho é válido
+                if qrmsa_env.qot_constraint == 'DIST':
+                    if path.length <= modulation.maximum_length:
+                        osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service, qrmsa_env.qot_constraint)
+                    else:
+                        continue  # Pular esta combinação se o caminho exceder a distância máxima
+                else:
+                    osnr, _, _ = calculate_osnr(qrmsa_env, qrmsa_env.current_service, qrmsa_env.qot_constraint)
+                    
                 if osnr >= modulation.minimum_osnr + qrmsa_env.margin and current_load < lowest_load:
                     lowest_load = current_load
                     solution = get_action_index(qrmsa_env, idp, idm, initial_slot)
@@ -652,7 +705,14 @@ def heuristic_mscl_sequential_simplified(env: Env) -> tuple[int, bool, bool]:
                 (sim_env.frequency_slot_bandwidth * (required_slots / 2))
             )
 
-            osnr, _, _ = calculate_osnr(sim_env, service_copy)
+            # Para DIST constraint, verificar se o caminho é válido antes do OSNR
+            if sim_env.qot_constraint == 'DIST':
+                if path.length <= modulation.maximum_length:
+                    osnr, _, _ = calculate_osnr(sim_env, service_copy, sim_env.qot_constraint)
+                else:
+                    continue  # Pular esta combinação se o caminho exceder a distância máxima
+            else:
+                osnr, _, _ = calculate_osnr(sim_env, service_copy, sim_env.qot_constraint)
 
             if osnr >= modulation.minimum_osnr + sim_env.margin:
                 # Calcula a pontuação de fragmentação para esta opção válida

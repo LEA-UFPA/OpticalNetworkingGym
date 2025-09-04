@@ -11,9 +11,6 @@ from datetime import datetime
 
 from optical_networking_gym.topology import Modulation, get_topology
 
-# ===================================================
-# Função para definir as cargas com base no nome da topologia
-# ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
         return np.arange(100, 501, 100)
@@ -27,11 +24,7 @@ def get_loads(topology_name: str) -> np.ndarray:
         return np.arange(100, 601, 50)
     else:
         raise ValueError(f"Unknown topology name: {topology_name}")
-
-# ===================================================
-# Função que executa o ambiente de simulação
-# (adaptada do código do launch power)
-# ===================================================
+    
 def run_environment(    
     n_eval_episodes,
     heuristic,
@@ -55,28 +48,6 @@ def run_environment(
     n_defrag_services,
     gen_observation,
 ) -> None:
-    """
-    Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
-
-    :param n_eval_episodes: Número de episódios a serem executados.
-    :param heuristic: Índice da heurística a ser utilizada.
-    :param monitor_file_name: Nome base para o arquivo CSV de monitoramento.
-    :param topology: Objeto de topologia.
-    :param seed: Semente para geração de números aleatórios.
-    :param allow_rejection: Permitir rejeição de solicitações.
-    :param load: Carga a ser utilizada na simulação.
-    :param episode_length: Número de chegadas por episódio.
-    :param num_spectrum_resources: Número de recursos de espectro.
-    :param launch_power_dbm: Potência de lançamento em dBm.
-    :param bandwidth: Largura de banda.
-    :param frequency_start: Frequência inicial.
-    :param frequency_slot_bandwidth: Largura de banda do slot de frequência.
-    :param bit_rate_selection: Seleção de taxa de bits.
-    :param bit_rates: Taxas de bits disponíveis.
-    :param margin: Margem.
-    :param file_name: Nome do arquivo para salvar serviços.
-    :param measure_disruptions: Medir interrupções.
-    """
     from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
     from optical_networking_gym.heuristics.heuristics import (
         shortest_available_path_first_fit_best_modulation,
@@ -145,7 +116,8 @@ def run_environment(
         file_handler.write(f"# Date: {datetime.now()}\n")
         header = (
             "episode,service_blocking_rate,episode_service_blocking_rate,"
-            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate, episode_service_realocations, episode_defrag_cicles"
+            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate, episode_service_realocations, episode_defrag_cicles,"
+            "fragmentation_shannon_entropy,fragmentation_route_cuts,fragmentation_route_rss"
         )
         for mf in env.env.modulations:
             header += f",modulation_{mf.spectral_efficiency}"
@@ -203,7 +175,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-t', '--topology_file',
         type=str,
-        default='nobel-eu.xml',#'nobel-eu.xml',
+        default='nobel-eu.xml',
         help='Arquivo de topologia a ser utilizado (default: nsfnet_chen.txt)'
     )
     parser.add_argument(
@@ -222,7 +194,6 @@ def parse_arguments() -> argparse.Namespace:
         '-th', '--threads',
         type=int,
         default=1,
-        default=15,
         help='Número de threads para execução das simulações (default: 2)'
     )
     # Argumento para a heurística a ser utilizada
@@ -252,42 +223,42 @@ def main():
     cur_modulations: Tuple[Modulation, ...] = (
         Modulation(
             name="BPSK",
-            maximum_length=100_000,
+            maximum_length=5_000,
             spectral_efficiency=1,
             minimum_osnr=3.71,
             inband_xt=-14,
         ),
         Modulation(
             name="QPSK",
-            maximum_length=2_000,
+            maximum_length=3_300,
             spectral_efficiency=2,
             minimum_osnr=6.72,
             inband_xt=-17,
         ),
         Modulation(
             name="8QAM",
-            maximum_length=1_000,
+            maximum_length=3_370,
             spectral_efficiency=3,
             minimum_osnr=10.84,
             inband_xt=-20,
         ),
         Modulation(
             name="16QAM",
-            maximum_length=500,
+            maximum_length=3_489,#500,
             spectral_efficiency=4,
             minimum_osnr=13.24,
             inband_xt=-23,
         ),
         Modulation(
             name="32QAM",
-            maximum_length=250,
+            maximum_length=2_652,
             spectral_efficiency=5,
             minimum_osnr=16.16,
             inband_xt=-26,
         ),
         Modulation(
             name="64QAM",
-            maximum_length=125,
+            maximum_length=1_387,
             spectral_efficiency=6,
             minimum_osnr=19.01,
             inband_xt=-29,
@@ -334,7 +305,7 @@ def main():
                 sim_args = (
                     args.num_episodes,              # n_eval_episodes
                     strategy,                       # heuristic_index
-                    f"{args.monitor_file_name}_{strategy}",  # monitor_file_name base
+                    f"{args.monitor_file_name}_{strategy}_ase_tst_def_{mensure[0]}_{mensure[1]}",  # monitor_file_name base
                     topology,                       # topology
                     seed,                           # seed
                     True,                           # allow_rejection
@@ -348,11 +319,11 @@ def main():
                     "discrete",                     # bit_rate_selection
                     bit_rates,                      # bit_rates
                     margin,                         # margin
-                    f"examples/jocn_benchmark_2024/results/load_services_{strategy}",  # file_name para serviços
+                    f"examples/jocn_benchmark_2024/results/load_services_ase_tst_{strategy}_def_{mensure[0]}_{mensure[1]}",  # file_name para serviços
                     False,                          # measure_disruptions
-                    False,                # measure_disruptions (True/False)
-                    0,                # measure_disruptions (valor)
-                    False,                          # run observation
+                    mensure[0],                # measure_disruptions (True/False)
+                    mensure[1],                # measure_disruptions (valor)
+                    False,
                 )
                 env_args.append(sim_args)
 

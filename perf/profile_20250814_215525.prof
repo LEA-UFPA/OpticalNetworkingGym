@@ -1,0 +1,38 @@
+         53782090 function calls (53782088 primitive calls) in 34.525 seconds
+
+   Ordered by: cumulative time
+   List reduced from 140 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.002    0.002   34.525   34.525 utils.py:94(run_heuristic)
+      499   18.602    0.037   34.230    0.069 qrmsa_gym.py:53(step)
+  1980752    0.679    0.000    8.597    0.000 fromnumeric.py:3618(round)
+  1987464    1.245    0.000    7.944    0.000 fromnumeric.py:51(_wrapfunc)
+  1980752    1.858    0.000    6.549    0.000 fromnumeric.py:41(_wrapit)
+  8763883    1.965    0.000    5.192    0.000 graph.py:498(__getitem__)
+  1980752    4.099    0.000    4.099    0.000 {method 'round' of 'numpy.ndarray' objects}
+  8763883    2.472    0.000    3.226    0.000 coreviews.py:81(__getitem__)
+  8763883    0.825    0.000    0.825    0.000 coreviews.py:53(__getitem__)
+  8763883    0.754    0.000    0.754    0.000 coreviews.py:44(__init__)
+    18026    0.176    0.000    0.327    0.000 _methods.py:150(_var)
+  3968216    0.277    0.000    0.277    0.000 {built-in method builtins.getattr}
+    18026    0.044    0.000    0.268    0.000 fromnumeric.py:3735(mean)
+    12019    0.021    0.000    0.254    0.000 fromnumeric.py:3869(std)
+    12019    0.029    0.000    0.233    0.000 _methods.py:220(_std)
+    18026    0.063    0.000    0.224    0.000 _methods.py:117(_mean)
+  1980753    0.223    0.000    0.223    0.000 {method 'wrap' of 'numpy._core._multiarray_umath._array_converter' objects}
+  1980753    0.222    0.000    0.222    0.000 {method 'as_arrays' of 'numpy._core._multiarray_umath._array_converter' objects}
+  1980752    0.179    0.000    0.179    0.000 fromnumeric.py:3614(_round_dispatcher)
+        1    0.089    0.089    0.156    0.156 qrmsa_gym.py:28(__init__)
+   101062    0.150    0.000    0.150    0.000 {built-in method numpy.asanyarray}
+     6007    0.014    0.000    0.139    0.000 fromnumeric.py:4073(var)
+        1    0.068    0.068    0.130    0.130 qrmsa_gym.py:43(reset)
+    68502    0.118    0.000    0.118    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+    20136    0.056    0.000    0.101    0.000 _function_base_impl.py:5661(append)
+    12525    0.016    0.000    0.075    0.000 fromnumeric.py:2338(sum)
+    36052    0.061    0.000    0.067    0.000 _methods.py:75(_count_reduce_items)
+    12531    0.021    0.000    0.057    0.000 fromnumeric.py:69(_wrapreduction)
+     6712    0.037    0.000    0.041    0.000 _function_base_impl.py:1391(diff)
+     6712    0.005    0.000    0.031    0.000 fromnumeric.py:2879(cumsum)
+
+

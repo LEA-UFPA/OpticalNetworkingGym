@@ -1,0 +1,38 @@
+         15025519 function calls (15025517 primitive calls) in 187.917 seconds
+
+   Ordered by: cumulative time
+   List reduced from 141 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.002    0.002  187.917  187.917 utils.py:94(run_heuristic)
+      499  178.223    0.357  187.679    0.376 qrmsa_gym.py:53(step)
+  1571806    0.631    0.000    8.151    0.000 fromnumeric.py:3618(round)
+  1578827    1.162    0.000    7.555    0.000 fromnumeric.py:51(_wrapfunc)
+  1571806    1.739    0.000    6.248    0.000 fromnumeric.py:41(_wrapit)
+  1571806    3.963    0.000    3.963    0.000 {method 'round' of 'numpy.ndarray' objects}
+    17464    0.219    0.000    0.374    0.000 _methods.py:150(_var)
+    17464    0.064    0.000    0.346    0.000 fromnumeric.py:3735(mean)
+    11738    0.025    0.000    0.287    0.000 fromnumeric.py:3869(std)
+    17464    0.084    0.000    0.281    0.000 _methods.py:117(_mean)
+    11738    0.035    0.000    0.262    0.000 _methods.py:220(_std)
+  3150633    0.249    0.000    0.249    0.000 {built-in method builtins.getattr}
+  1571807    0.214    0.000    0.214    0.000 {method 'as_arrays' of 'numpy._core._multiarray_umath._array_converter' objects}
+  1571807    0.202    0.000    0.202    0.000 {method 'wrap' of 'numpy._core._multiarray_umath._array_converter' objects}
+  1571806    0.184    0.000    0.184    0.000 fromnumeric.py:3614(_round_dispatcher)
+     5726    0.017    0.000    0.167    0.000 fromnumeric.py:4073(var)
+    67815    0.160    0.000    0.160    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+   101539    0.145    0.000    0.145    0.000 {built-in method numpy.asanyarray}
+    21063    0.075    0.000    0.135    0.000 _function_base_impl.py:5661(append)
+        1    0.085    0.085    0.122    0.122 qrmsa_gym.py:28(__init__)
+        1    0.070    0.070    0.106    0.106 qrmsa_gym.py:43(reset)
+    12525    0.021    0.000    0.102    0.000 fromnumeric.py:2338(sum)
+    13533    0.032    0.000    0.087    0.000 fromnumeric.py:69(_wrapreduction)
+    34928    0.078    0.000    0.086    0.000 _methods.py:75(_count_reduce_items)
+     7021    0.054    0.000    0.060    0.000 _function_base_impl.py:1391(diff)
+     7021    0.007    0.000    0.042    0.000 fromnumeric.py:2879(cumsum)
+    21063    0.019    0.000    0.034    0.000 fromnumeric.py:1904(ravel)
+     7021    0.026    0.000    0.026    0.000 {method 'cumsum' of 'numpy.ndarray' objects}
+    97724    0.016    0.000    0.016    0.000 {built-in method builtins.isinstance}
+     1503    0.009    0.000    0.013    0.000 random.py:480(choices)
+
+
