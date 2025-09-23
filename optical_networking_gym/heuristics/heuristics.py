@@ -797,13 +797,7 @@ def try_allocate_in_band(sim_env, k_paths, band_idx):
 
 
 def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tuple[int, bool, bool]:
-    """
-    Heurística que tenta alocar na rota mais curta disponível, com first-fit,
-    melhor modulação e melhor banda (versão corrigida para multiband).
-    
-    Returns:
-        tuple[int, bool, bool]: (action_index, blocked_due_to_resources, blocked_due_to_osnr)
-    """
+
     blocked_due_to_resources, blocked_due_to_osnr = False, False
     sim_env = get_qrmsa_env(env)
     source = sim_env.current_service.source

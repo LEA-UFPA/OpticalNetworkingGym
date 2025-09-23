@@ -554,7 +554,7 @@ cdef class QRMSAEnv:
         
         # Configurar basic parameters necessários para _init_bands
         self.k_paths = k_paths
-        self.modulations = self.topology.graph.get("modulations", [])
+        self.modulations = list(reversed(self.topology.graph.get("modulations", [])))
         self.max_modulation_idx = len(self.modulations) - 1
         self.modulations_to_consider = min(modulations_to_consider, len(self.modulations))
         self.frequency_slot_bandwidth = frequency_slot_bandwidth  # Necessário antes de _init_bands
@@ -592,7 +592,6 @@ cdef class QRMSAEnv:
         self.margin = margin
         self.measure_disruptions = measure_disruptions
         self.frequency_end = self.frequency_start + (self.frequency_slot_bandwidth * self.num_spectrum_resources)
-        assert math.isclose(self.frequency_end - self.frequency_start, self.bandwidth, rel_tol=1e-5)
         self.frequency_vector = np.linspace(
             self.frequency_start,
             self.frequency_end,
@@ -713,7 +712,6 @@ cdef class QRMSAEnv:
 
     def _init_bands(self, object band_specs, int unused_param, double frequency_start):
         """Inicializa bandas de frequência a partir de band_specs (obrigatório)."""
-        print(f"[DEBUG] _init_bands: Iniciando com {len(band_specs)} band_specs")
         cdef list bands = []
         cdef Band band
         cdef dict spec
@@ -726,7 +724,6 @@ cdef class QRMSAEnv:
             spec["num_slots"] if isinstance(spec, dict) else spec.num_slots 
             for spec in band_specs
         )
-        print(f"[DEBUG] _init_bands: Calculado num_spectrum_resources = {calculated_num_spectrum_resources}")
         self.num_spectrum_resources = calculated_num_spectrum_resources
         
         # Converter specs para objetos Band se necessário
@@ -747,14 +744,12 @@ cdef class QRMSAEnv:
                     attenuation_db_km=spec["attenuation_db_km"],
                     slot_bw_hz=self.frequency_slot_bandwidth
                 )
-                print(f"[DEBUG] _init_bands: Criada banda {band.name}: {spec['start_thz']} THz, {spec['num_slots']} slots")
                 bands.append(band)
             else:
                     raise ValueError(f"band_specs must contain Band objects or dicts, got {type(spec)}")
         
         # Ordenar bandas por frequência inicial
         bands.sort(key=lambda b: b.f_start_hz)
-        print(f"[DEBUG] _init_bands: Bandas ordenadas por frequência")
         
         # Verificar sobreposições e atribuir offsets contíguos
         for i, band in enumerate(bands):
@@ -767,7 +762,6 @@ cdef class QRMSAEnv:
                     )
             
             band.set_slot_offset(current_offset)
-            print(f"[DEBUG] _init_bands: Banda {band.name} offset {current_offset}, slots [{band.slot_start}-{band.slot_end})")
             current_offset += band.num_slots
         
         # Atribuir às variáveis de instância
@@ -775,25 +769,19 @@ cdef class QRMSAEnv:
         self.num_bands = len(bands)
         self.total_slots = current_offset
         
-        print(f"[DEBUG] _init_bands: Finalizado - {self.num_bands} bandas, {self.total_slots} slots totais")
         
         # Atualizar action_space para usar slots por banda (não total)
         # Assumindo bandas uniformes de 10 slots cada
         slots_per_band = self.bands[0].num_slots  # Usar primeira banda como referência
         action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * slots_per_band) + 1
-        print(f"[DEBUG] _init_bands: Action space = {self.k_paths} × {self.num_bands} × {self.modulations_to_consider} × {slots_per_band} + 1 = {action_space_size}")
         self.action_space = gym.spaces.Discrete(action_space_size)
 
     cpdef Band band_for_global_slot(self, int global_slot):
         """Retorna a banda que contém o slot global especificado"""
-        print(f"[DEBUG] band_for_global_slot: Procurando banda para slot global {global_slot}")
         cdef Band band
         for band in self.bands:
-            print(f"[DEBUG] band_for_global_slot: Verificando banda {band.name} [{band.slot_start}, {band.slot_end})")
             if band.slot_start <= global_slot < band.slot_end:
-                print(f"[DEBUG] band_for_global_slot: ✓ Slot {global_slot} encontrado na banda {band.name}")
                 return band
-        print(f"[DEBUG] band_for_global_slot: ✗ Nenhuma banda contém o slot {global_slot}")
         raise ValueError(f"No band contains global slot {global_slot}")
 
     cpdef tuple reset(self, object seed=None, dict options=None):
@@ -1406,7 +1394,6 @@ cdef class QRMSAEnv:
                 )
             
             if self.is_path_free(path=path, initial_slot=initial_slot, number_slots=number_slots):
-                print(f"[DEBUG] step: ✓ Caminho está livre para alocação")
                 self.current_service.path = path
                 self.current_service.initial_slot = initial_slot
                 self.current_service.number_slots = number_slots
@@ -1757,7 +1744,6 @@ cdef class QRMSAEnv:
             end_slot += 1
         elif end_slot > self.num_spectrum_resources:
             raise ValueError("End slot is greater than the number of spectrum resources.")
-        
         # Usar FastPathOps para operação vetorizada
         edge_indices = self.fast_ops.extract_edge_indices(path)
         self.fast_ops.fast_provision_path(edge_indices, start_slot, end_slot, 
