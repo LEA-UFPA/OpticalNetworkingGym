@@ -17,7 +17,7 @@ from optical_networking_gym.topology import Modulation, get_topology
 # ===================================================
 def get_loads(topology_name: str) -> np.ndarray:
     if topology_name == "nobel-eu.xml":
-        return np.arange(900, 1201, 100)
+        return np.arange(300, 901, 50)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
@@ -56,6 +56,7 @@ def run_environment(
     n_defrag_services,
     gen_observation,
     band_specs: List[dict] = None,
+    debug: bool = False,
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
@@ -81,6 +82,8 @@ def run_environment(
     :param defragmentation: Habilita defragmentação.
     :param n_defrag_services: Número de serviços defragmentados por ciclo.
     :param gen_observation: Gera observação para agentes RL.
+    :param band_specs: Especificações das bandas para simulação multibanda.
+    :param debug: Habilita debug visual dos slots (apenas primeiro episódio).
     """
     from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
     from optical_networking_gym.heuristics.heuristics import (
@@ -93,31 +96,55 @@ def run_environment(
         heuristic_highest_snr,
         heuristic_lowest_fragmentation,
         heuristic_priority_band_C_then_L,
+        shortest_available_path_first_fit_best_modulation_best_band,
     )
 
-    # Configurações do ambiente
-    env_args = dict(
-        topology=topology,
-        seed=seed,
-        allow_rejection=allow_rejection,
-        load=load,
-        episode_length=episode_length,
-        num_spectrum_resources=num_spectrum_resources,
-        launch_power_dbm=launch_power_dbm,
-        bandwidth=bandwidth,
-        frequency_start=frequency_start,
-        frequency_slot_bandwidth=frequency_slot_bandwidth,
-        bit_rate_selection=bit_rate_selection,
-        bit_rates=bit_rates,
-        margin=margin,
-        file_name=file_name,
-        measure_disruptions=measure_disruptions,
-        k_paths=5, 
-        modulations_to_consider=6,
-        defragmentation=defragmentation,
-        n_defrag_services=n_defrag_services,
-        gen_observation=gen_observation,
-    )
+    # Configurações do ambiente - Usando band_specs diretamente se fornecido
+    if band_specs:
+        env_args = dict(
+            topology=topology,
+            band_specs=band_specs,
+            seed=seed,
+            allow_rejection=allow_rejection,
+            load=load,
+            episode_length=episode_length,
+            launch_power_dbm=launch_power_dbm,
+            frequency_slot_bandwidth=frequency_slot_bandwidth,
+            bit_rate_selection=bit_rate_selection,
+            bit_rates=bit_rates,
+            margin=margin,
+            file_name=file_name,
+            measure_disruptions=measure_disruptions,
+            k_paths=5, 
+            modulations_to_consider=6,
+            defragmentation=defragmentation,
+            n_defrag_services=n_defrag_services,
+            gen_observation=gen_observation,
+        )
+    else:
+        # Configuração tradicional (backward compatibility)
+        env_args = dict(
+            topology=topology,
+            seed=seed,
+            allow_rejection=allow_rejection,
+            load=load,
+            episode_length=episode_length,
+            num_spectrum_resources=num_spectrum_resources,
+            launch_power_dbm=launch_power_dbm,
+            bandwidth=bandwidth,
+            frequency_start=frequency_start,
+            frequency_slot_bandwidth=frequency_slot_bandwidth,
+            bit_rate_selection=bit_rate_selection,
+            bit_rates=bit_rates,
+            margin=margin,
+            file_name=file_name,
+            measure_disruptions=measure_disruptions,
+            k_paths=5, 
+            modulations_to_consider=6,
+            defragmentation=defragmentation,
+            n_defrag_services=n_defrag_services,
+            gen_observation=gen_observation,
+        )
 
     # Seleção da heurística baseada no índice
     if heuristic == 1:
@@ -130,6 +157,8 @@ def run_environment(
         fn_heuristic = load_balancing_best_modulation
     elif heuristic == 5:  # Escolha um índice para sua heurística de prioridade
         fn_heuristic = heuristic_priority_band_C_then_L
+    elif heuristic == 6:  # Nova heurística multibanda
+        fn_heuristic = shortest_available_path_first_fit_best_modulation_best_band
     else:
         raise ValueError(f"Heuristic index `{heuristic}` is not found!")
 
@@ -169,9 +198,25 @@ def run_environment(
             obs, info = env.reset()
             done = False
             start_time = time.time()
+            step_count = 0
+            
             while not done:
+                # Debug visual - mostrar slots antes da alocação
+                if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
+                    print_link_slots(env, "ANTES DA ALOCAÇÃO")
+                    print(f"\nCurrent service: {env.env.current_service}")
+                
                 action,_,_ = fn_heuristic(env)
                 _, _, done, _, info = env.step(action)
+                
+                # Debug visual - mostrar slots depois da alocação
+                if debug and ep == 0 and step_count < 5:
+                    print_link_slots(env, "DEPOIS DA ALOCAÇÃO")
+                    print(f"Action taken: {action}")
+                    print("-" * 50)
+                
+                step_count += 1
+                
             end_time = time.time()
             ep_time = end_time - start_time
 
@@ -202,6 +247,21 @@ def run_environment(
 def starmap_helper(args):
     """Helper function for multiprocessing starmap compatibility"""
     return run_environment(*args)
+
+def print_link_slots(env, stage):
+    """Função para debug visual dos slots nos links"""
+    print(f"\n=== LINKS {stage} ===")
+    for u, v in env.env.topology.edges():
+        idx = env.env.topology[u][v]["index"]
+        slots = env.env.topology.graph["available_slots"][idx]
+        print(f"Link {u}->{v} slots: {''.join(map(str, slots.tolist()))}")
+
+def define_modulations_simplified():
+    """Modulações simplificadas do test_simple"""
+    return (
+        Modulation("QPSK", 200_000, 2, minimum_osnr=6.72, inband_xt=-17),
+        Modulation("16QAM", 500, 4, minimum_osnr=13.24, inband_xt=-23),
+    )
 
 # ===================================================
 # Configuração de logging, semente e argumentos de entrada
@@ -244,8 +304,8 @@ def parse_arguments() -> argparse.Namespace:
         '-hi', '--heuristic_index',
         type=int,
         default=1,
-        choices=[1, 2, 3, 4, 5],
-        help='Índice da heurística (1: First Fit, 2: Lowest Spectrum, 3: Load Balancing Modulation, 4: Load Balancing Best Modulation, 5: Prioridade Banda C então L)'
+        choices=[1, 2, 3, 4, 5, 6],
+        help='Índice da heurística (1: First Fit, 2: Lowest Spectrum, 3: Load Balancing Modulation, 4: Load Balancing Best Modulation, 5: Prioridade Banda C então L, 6: Multibanda Best Band)'
     )
     # Nome base para o arquivo CSV de monitoramento
     parser.add_argument(
@@ -259,6 +319,27 @@ def parse_arguments() -> argparse.Namespace:
                         choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
                         help='Especifica uma ou mais bandas para simular (ex: --bands BandaC BandaL BandaC+L).')
     
+    # Argumento para habilitar debug visual
+    parser.add_argument(
+        '-d', '--debug',
+        action='store_true',
+        help='Habilita debug visual dos slots (apenas para o primeiro episódio)'
+    )
+    
+    # Argumento para usar modulações simplificadas
+    parser.add_argument(
+        '-sm', '--simple_modulations',
+        action='store_true',
+        help='Usa apenas 2 modulações (QPSK e 16QAM) como no test_simple'
+    )
+    
+    # Argumento para modo de teste simples (como test_simple.py)
+    parser.add_argument(
+        '-st', '--simple_test',
+        action='store_true',
+        help='Executa no modo de teste simples: ring_4, 5 episódios curtos, debug habilitado'
+    )
+    
     return parser.parse_args()
 
 # ===================================================
@@ -266,10 +347,23 @@ def parse_arguments() -> argparse.Namespace:
 # ===================================================
 def main():
     args = parse_arguments()
+    
+    # Modo de teste simples - sobrescreve configurações para replicar test_simple.py
+    if args.simple_test:
+        args.topology_file = "ring_4.txt"
+        args.num_episodes = 1  # Apenas 1 episódio para debug
+        args.episode_length = 5  # Episódios curtos
+        args.debug = True
+        args.simple_modulations = True
+        args.heuristic_index = 6  # Usa a heurística multibanda
+        args.bands = ['BandaC+L']  # Multibanda
+        print("=== MODO TESTE SIMPLES ATIVADO ===")
+        print("Configurações: ring_4, 1 episódio, 5 steps, debug ON, modulações simples, heurística multibanda")
+        print("="*50)
 
     # Multi-band functionality: Add band specifications with physical parameters
     band_specifications = {
-        "BandaC": {"frequency_start": 191.60e12, "num_spectrum_resources": 320,
+        "BandaC": {"frequency_start": 191.60e12, "num_spectrum_resources": 344,
                    "attenuation": 0.191, "noise_figure": 5.5},
         "BandaL": {"frequency_start": 185.83e12, "num_spectrum_resources": 320,
                    "attenuation": 0.200, "noise_figure": 6},
@@ -281,65 +375,87 @@ def main():
         ]
     }
 
-    # Definição das modulações (valores atualizados conforme exemplo do launch power)
-    cur_modulations: Tuple[Modulation, ...] = (
-        Modulation(
-            name="BPSK",
-            maximum_length=100_000,
-            spectral_efficiency=1,
-            minimum_osnr=3.71,
-            inband_xt=-14,
-        ),
-        Modulation(
-            name="QPSK",
-            maximum_length=2_000,
-            spectral_efficiency=2,
-            minimum_osnr=6.72,
-            inband_xt=-17,
-        ),
-        Modulation(
-            name="8QAM",
-            maximum_length=1_000,
-            spectral_efficiency=3,
-            minimum_osnr=10.84,
-            inband_xt=-20,
-        ),
-        Modulation(
-            name="16QAM",
-            maximum_length=500,
-            spectral_efficiency=4,
-            minimum_osnr=13.24,
-            inband_xt=-23,
-        ),
-        Modulation(
-            name="32QAM",
-            maximum_length=250,
-            spectral_efficiency=5,
-            minimum_osnr=16.16,
-            inband_xt=-26,
-        ),
-        Modulation(
-            name="64QAM",
-            maximum_length=125,
-            spectral_efficiency=6,
-            minimum_osnr=19.01,
-            inband_xt=-29,
-        ),
-    )
+    # Escolha das modulações baseada no argumento
+    if args.simple_modulations:
+        cur_modulations = define_modulations_simplified()
+        print("Usando modulações simplificadas (QPSK e 16QAM)")
+    else:
+        # Definição das modulações (valores atualizados conforme exemplo do launch power)
+        cur_modulations: Tuple[Modulation, ...] = (
+            Modulation(
+                name="BPSK",
+                maximum_length=100_000,
+                spectral_efficiency=1,
+                minimum_osnr=3.71,
+                inband_xt=-14,
+            ),
+            Modulation(
+                name="QPSK",
+                maximum_length=2_000,
+                spectral_efficiency=2,
+                minimum_osnr=6.72,
+                inband_xt=-17,
+            ),
+            Modulation(
+                name="8QAM",
+                maximum_length=1_000,
+                spectral_efficiency=3,
+                minimum_osnr=10.84,
+                inband_xt=-20,
+            ),
+            Modulation(
+                name="16QAM",
+                maximum_length=500,
+                spectral_efficiency=4,
+                minimum_osnr=13.24,
+                inband_xt=-23,
+            ),
+            Modulation(
+                name="32QAM",
+                maximum_length=250,
+                spectral_efficiency=5,
+                minimum_osnr=16.16,
+                inband_xt=-26,
+            ),
+            Modulation(
+                name="64QAM",
+                maximum_length=125,
+                spectral_efficiency=6,
+                minimum_osnr=19.01,
+                inband_xt=-29,
+            ),
+        )
+        print("Usando modulações completas (6 modulações)")
 
     attenuation_db_km = 0.2
     default_noise_figure_db = 4.5
 
     
-    topology_path = f"/home/lucashenrique/MeusProjetos/LEA/ONG/OpticalNetworkingGym/examples/topologies/nobel-eu.xml"
+    # Determinar o caminho da topologia baseado na extensão
+    if args.topology_file.endswith('.xml'):
+        topology_path = f"/home/lucas/Documentos/ONG/OpticalNetworkingGym/examples/topologies/{args.topology_file}"
+    else:
+        topology_path = f"/home/lucas/Documentos/ONG/OpticalNetworkingGym/examples/topologies/{args.topology_file}"
+        
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
         
-    band_specs = [
-        {"name": "C", "start_thz": 191.60, "num_slots": 320, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-        {"name": "S", "start_thz": 197.22, "num_slots": 320, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
-        {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
-    ]
+    # Configuração especial para ring_4 (inspirada no test_simple)
+    if args.topology_file == "ring_4.txt":
+        special_band_specs = [
+            {"name": "L", "start_thz": 186.00, "num_slots": 10, "noise_figure_db": 4.5, "attenuation_db_km": 0.22},
+            {"name": "C", "start_thz": 191.60, "num_slots": 10, "noise_figure_db": 5.0, "attenuation_db_km": 0.20},
+            {"name": "S", "start_thz": 197.22, "num_slots": 10, "noise_figure_db": 6.0, "attenuation_db_km": 0.24},
+        ]
+        print("Usando configuração especial de band_specs para ring_4")
+    else:
+        special_band_specs = [
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+            {"name": "S", "start_thz": 197.22, "num_slots": 320, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
+            {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+        ]
+        
+    band_specs = special_band_specs
     # Parâmetros de simulação
     threads = args.threads
     bandwidth = 4e12
@@ -348,7 +464,7 @@ def main():
     bit_rates = (48,120)
     margin = 0
 
-    launch_power = 9.0
+    launch_power = 0.0
 
     loads = get_loads(args.topology_file)
 
@@ -361,8 +477,8 @@ def main():
     for band_name in args.bands:
         if band_name == "BandaC+L":
             band_specs = [
-                {"name": "C", "start_thz": 191.60, "num_slots": 320, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-                {"name": "L", "start_thz": 185.83, "num_slots": 320, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+                {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+                {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
             ]
             topology = get_topology(
                 topology_path,
@@ -396,7 +512,8 @@ def main():
                     False,
                     0,
                     False,
-                    band_specs 
+                    band_specs,
+                    args.debug
                 )
         else:
             # Simulação para banda única 
@@ -433,7 +550,8 @@ def main():
                     False,
                     0,
                     False,
-                    [specs]  
+                    [specs],
+                    args.debug
                 )
 
     # Execução das simulações utilizando multiprocessing se houver mais de uma thread
@@ -454,4 +572,15 @@ def main():
     print("Todas as simulações foram executadas.")
 
 if __name__ == "__main__":
+    # Exemplos de uso:
+    # 
+    # Modo de teste simples (equivalente ao test_simple.py):
+    # python graph_load.py --simple_test
+    #
+    # Modo normal com debug visual:
+    # python graph_load.py -t ring_4.txt -d -sm -hi 6
+    #
+    # Simulação completa com multibanda:
+    # python graph_load.py -t nobel-eu.xml -mb BandaC+L -hi 6 -e 10
+    #
     main()
