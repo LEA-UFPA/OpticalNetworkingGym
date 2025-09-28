@@ -57,16 +57,26 @@ cpdef calculate_osnr(env: QRMSAEnv, current_service: object):
         
         # Para cada span do link
         for span in link_data["link"].spans:
+            # Usar parâmetros da banda do serviço se disponível
+            if hasattr(current_service, 'current_band') and current_service.current_band is not None:
+                # Converter dB para linear
+                attenuation_normalized = (current_service.current_band.attenuation_db_km / 1000.0) / (10.0 * log10(exp(1)))
+                noise_figure_normalized = 10.0 ** (current_service.current_band.noise_figure_db / 10.0)
+            else:
+                # Usar parâmetros originais do span
+                attenuation_normalized = span.attenuation_normalized
+                noise_figure_normalized = span.noise_figure_normalized
+            
             # Cálculo da L_eff e L_eff_a
-            l_eff_a = 1.0 / (2.0 * span.attenuation_normalized)
+            l_eff_a = 1.0 / (2.0 * attenuation_normalized)
             l_eff = (
-                1.0 - np.exp(-2.0 * span.attenuation_normalized * span.length * 1e3)
-            ) / (2.0 * span.attenuation_normalized)
+                1.0 - np.exp(-2.0 * attenuation_normalized * span.length * 1e3)
+            ) / (2.0 * attenuation_normalized)
 
             # Inicia sum_phi para este span
             sum_phi = asinh(
                 pi**2 * abs(beta_2) * (current_service.bandwidth**2) /
-                (4.0 * span.attenuation_normalized)
+                (4.0 * attenuation_normalized)
             )
 
             # Soma das contribuições NLI de outros serviços rodando nesse link
@@ -153,8 +163,8 @@ cpdef calculate_osnr(env: QRMSAEnv, current_service: object):
                 current_service.bandwidth
                 * h_plank
                 * current_service.center_frequency
-                * (exp(2.0 * span.attenuation_normalized * span.length * 1e3) - 1.0)
-                * span.noise_figure_normalized
+                * (exp(2.0 * attenuation_normalized * span.length * 1e3) - 1.0)
+                * noise_figure_normalized
             )
 
             # Somatório para GSNR, ASE e NLI
@@ -301,7 +311,8 @@ cpdef double calculate_osnr_observation(
     double service_center_frequency,
     int service_id,
     double service_launch_power,
-    double gsnr_th
+    double gsnr_th,
+    object band = None  # Novo parâmetro para banda
 ):
     cdef double beta_2 = -21.3e-27
     cdef double gamma = 1.3e-3
@@ -339,17 +350,27 @@ cpdef double calculate_osnr_observation(
             link_data = env.topology[link.node1][link.node2]
             
         for span in link_data["link"].spans:
-            l_eff_a = 1.0 / (2.0 * span.attenuation_normalized)
+            # Usar parâmetros da banda se fornecida, senão usar span original
+            if band is not None:
+                # Converter dB para linear
+                attenuation_normalized = (band.attenuation_db_km / 1000.0) / (10.0 * log10(exp(1)))
+                noise_figure_normalized = 10.0 ** (band.noise_figure_db / 10.0)
+            else:
+                # Usar parâmetros originais do span
+                attenuation_normalized = span.attenuation_normalized
+                noise_figure_normalized = span.noise_figure_normalized
+            
+            l_eff_a = 1.0 / (2.0 * attenuation_normalized)
             l_eff = (
-                1.0 - exp(-2.0 * span.attenuation_normalized * span.length * 1e3)
-            ) / (2.0 * span.attenuation_normalized)
+                1.0 - exp(-2.0 * attenuation_normalized * span.length * 1e3)
+            ) / (2.0 * attenuation_normalized)
 
             # sum_phi para este span
             sum_phi = asinh(
                 pi**2
                 * abs(beta_2)
                 * (service_bandwidth**2)
-                / (4.0 * span.attenuation_normalized)
+                / (4.0 * attenuation_normalized)
             )
 
             # Contribuição dos serviços em execução - usar cache com fallback
@@ -407,8 +428,8 @@ cpdef double calculate_osnr_observation(
                 service_bandwidth
                 * h_plank
                 * service_center_frequency
-                * (exp(2.0 * span.attenuation_normalized * span.length * 1e3) - 1.0)
-                * span.noise_figure_normalized
+                * (exp(2.0 * attenuation_normalized * span.length * 1e3) - 1.0)
+                * noise_figure_normalized
             )
 
             # Somatório

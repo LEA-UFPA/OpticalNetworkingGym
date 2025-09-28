@@ -224,19 +224,18 @@ def read_txt_file(file_name: str) -> nx.Graph:
                 num_nodes = int(line)
                 for _id in range(1, num_nodes + 1):
                     graph.add_node(str(_id), name=str(_id))
-            elif idx == 1:
-                continue
-            elif len(line) > 1:
+            elif len(line.strip()) > 1:  # Removido: elif idx == 1: continue (causa bug)
                 info = line.replace("\n", "").split(" ")
-                graph.add_edge(
-                    info[0],
-                    info[1],
-                    id=id_link,
-                    index=id_link,
-                    weight=1,
-                    length=int(info[2]),
-                )
-                id_link += 1
+                if len(info) >= 3:  # Verificar se tem pelo menos 3 elementos
+                    graph.add_edge(
+                        info[0],
+                        info[1],
+                        id=id_link,
+                        index=id_link,
+                        weight=1,
+                        length=int(info[2]),
+                    )
+                    id_link += 1
 
     return graph
 
