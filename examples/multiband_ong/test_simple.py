@@ -177,6 +177,10 @@ def run_environment_with_monitoring(
     Baseado na função run_environment do graph_load.py
     """
     
+    print(f"\n[DEBUG] Função run_environment_with_monitoring chamada com debug={debug}")
+    print(f"[DEBUG] monitor_file_name={monitor_file_name}")
+    print(f"[DEBUG] n_eval_episodes={n_eval_episodes}")
+    
     # Configurações do ambiente - Usando band_specs diretamente se fornecido
     if band_specs:
         env_args = dict(
@@ -307,14 +311,18 @@ def run_environment_with_monitoring(
         print(f"\nFinalizado! Resultados salvos em: {monitor_final_name}")
     else:
         # Executar sem monitoramento (modo simples)
+        print(f"[DEBUG] Executando modo SEM monitoramento (debug={debug})")
         for ep in range(n_eval_episodes):
             obs, info = env.reset()
             done = False
             step_count = 0
             
+            print(f"\n=== EPISÓDIO {ep + 1}/{n_eval_episodes} (MODO SEM MONITORAMENTO) ===")
+            
             while not done:
                 # Debug visual - mostrar slots antes da alocação
                 if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
+                    print(f"[DEBUG] Executando debug para ep={ep}, step={step_count}")
                     print_link_slots(env, "ANTES DA ALOCAÇÃO")
                     print(f"\nCurrent service: {env.env.current_service}")
                 
@@ -328,6 +336,9 @@ def run_environment_with_monitoring(
                     print("-" * 50)
                 
                 step_count += 1
+            
+            print(f"Episódio {ep + 1} finalizado com {step_count} steps.")
+            print(f"Info: {info}")
 
 def create_environment(topology_name="nobel-eu.xml", episode_length=10, simple_modulations=True, debug=True):
     """Cria o ambiente de teste baseado na configuração do graph_load.py"""
@@ -374,7 +385,7 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, simple_m
         allow_rejection=True,
         load=300,
         episode_length=episode_length,
-        launch_power_dbm=0,
+        launch_power_dbm=10,  # Aumentado de 0 para 10 dBm (10 mW)
         frequency_slot_bandwidth=12.5e9,
         bit_rate_selection="discrete",
         bit_rates=(48, 120),
@@ -393,75 +404,6 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, simple_m
     
     return env_args, debug
 
-def run_test_simple():
-    """Função principal para executar o teste simples usando a nova estrutura"""
-    # Configurações fixas para o teste
-    topology_name = "nobel-eu.xml"  # Nome correto do arquivo
-    episode_length = 100000
-    num_episodes = 5
-    simple_modulations = True
-    debug = True
-    heuristic_index = 1  # Heurística multibanda
-    
-    # Escolher modulações
-    if simple_modulations:
-        mods = define_modulations_simplified()
-        print("Usando modulações simplificadas (QPSK e 16QAM)")
-    else:
-        mods = define_modulations()
-        print("Usando modulações completas (6 modulações)")
-    
-    # Determinar o arquivo de topologia (caminho correto)
-    if topology_name.endswith('.xml'):
-        topo_file = f"examples/topologies/{topology_name}"
-    else:
-        topo_file = f"examples/topologies/{topology_name}.txt"
-    
-    # Verificar se o arquivo existe
-    if not os.path.exists(topo_file):
-        raise FileNotFoundError(f"Arquivo de topologia '{topo_file}' não encontrado.")
-    
-    # Criar topologia
-    topology = get_topology(
-        topo_file, None, mods,
-        max_span_length=100, 
-        default_attenuation=0.2,
-        default_noise_figure=4.5, 
-        k_paths=2
-    )
-    
-    # Configuração de banda multibanda baseada no graph_load.py
-    band_specs = [
-        {"name": "L", "start_thz": 186.00, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.20},
-        {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-        {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.22},
-    ]
-    
-    # Executar usando a nova função
-    run_environment_with_monitoring(
-        n_eval_episodes=num_episodes,
-        heuristic_index=heuristic_index,
-        monitor_file_name=None,  # Sem arquivo de monitoramento para teste simples
-        topology=topology,
-        seed=10,
-        allow_rejection=True,
-        load=300,
-        episode_length=episode_length,
-        launch_power_dbm=0,
-        frequency_slot_bandwidth=12.5e9,
-        bit_rate_selection="discrete",
-        bit_rates=(48, 120),
-        margin=0,
-        file_name="",
-        measure_disruptions=False,
-        defragmentation=False,
-        n_defrag_services=0,
-        gen_observation=False,
-        band_specs=band_specs,
-        debug=debug
-    )
-    
-    print("Todas as simulações foram executadas.")
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Teste Simples de Rede Óptica Multibanda')
@@ -480,7 +422,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=100000,
+        default=1000,
         help='Número de chegadas por episódio (default: 10)'
     )
     parser.add_argument(
@@ -506,9 +448,9 @@ def parse_arguments() -> argparse.Namespace:
         help='Habilita debug visual dos slots'
     )
     parser.add_argument(
-        '-sm', '--simple_modulations',
+        '-simple', '--simple_modulations',
         action='store_true',
-        help='Usa apenas 6 modulações (BPSK até 64QAM) ao invés das simplificadas'
+        help='Usa apenas 2 modulações simplificadas (QPSK e 16QAM) ao invés das 6 completas'
     )
     parser.add_argument(
         '-st', '--simple_test',
@@ -521,6 +463,12 @@ def parse_arguments() -> argparse.Namespace:
         default=300.0,
         help='Carga da simulação (default: 300.0)'
     )
+    parser.add_argument(
+        '-p', '--power',
+        type=float,
+        default=10.0,
+        help='Potência de lançamento em dBm (default: 10.0)'
+    )
     
     return parser.parse_args()
 
@@ -532,27 +480,30 @@ def main():
     if args.simple_test:
         args.topology_file = "nobel-eu.xml"  # Nome correto
         args.num_episodes = 5
-        args.episode_length = 100000
+        args.episode_length = 10
         args.debug = True
         args.heuristic_index = 1
         args.bands = ['BandaC']
         print("=== MODO TESTE SIMPLES ATIVADO ===")
-        print("Configurações: nobel-eu, 5 episódios, 100000 steps, debug ON, heurística First Fit")
+        print("Configurações: nobel-eu, 5 episódios, 10 steps, debug ON, heurística First Fit")
         print("="*50)
 
     # Escolha das modulações baseada no argumento
     if args.simple_modulations:
-        cur_modulations = define_modulations()
-        print("Usando modulações completas (6 modulações)")
-    else:
         cur_modulations = define_modulations_simplified()
         print("Usando modulações simplificadas (QPSK e 16QAM)")
-
-    # Determinar o caminho da topologia
-    if args.topology_file.endswith('.xml'):
-        topology_path = f"examples/topologies/{args.topology_file}"
     else:
-        topology_path = f"examples/topologies/{args.topology_file}"
+        cur_modulations = define_modulations()
+        print("Usando modulações completas (6 modulações: BPSK, QPSK, 8QAM, 16QAM, 32QAM, 64QAM)")
+
+    # Determinar o caminho da topologia (caminho absoluto baseado no diretório do script)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    topologies_dir = os.path.join(script_dir, "..", "topologies")
+    
+    if args.topology_file.endswith('.xml'):
+        topology_path = os.path.join(topologies_dir, args.topology_file)
+    else:
+        topology_path = os.path.join(topologies_dir, args.topology_file)
         
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
@@ -612,7 +563,7 @@ def main():
             allow_rejection=True,
             load=args.load,
             episode_length=args.episode_length,
-            launch_power_dbm=0.0,
+            launch_power_dbm=args.power,  # Usar potência configurável
             frequency_slot_bandwidth=12.5e9,
             bit_rate_selection="discrete",
             bit_rates=(48, 120),
@@ -630,8 +581,10 @@ def main():
 
 if __name__ == "__main__":
     if len(os.sys.argv) == 1:
-        # Se nenhum argumento foi passado, executar o teste simples padrão
-        run_test_simple()
+        # Se nenhum argumento foi passado, usar configurações padrão normais
+        # Simular argumentos padrão (nobel-eu, 5 episódios, 1000 steps)
+        os.sys.argv = ['test_simple.py', '-t', 'nobel-eu.xml', '-e', '5', '-s', '1000']
+        main()
     else:
         # Se argumentos foram passados, usar o parser
         main()
