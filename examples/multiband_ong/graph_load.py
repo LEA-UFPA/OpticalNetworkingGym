@@ -518,6 +518,14 @@ def main():
         else:
             # Simulação para banda única 
             specs = band_specifications[band_name]
+            # Convert single band spec to the format expected by band_specs
+            band_spec = {
+                "name": band_name,
+                "start_thz": specs["frequency_start"] / 1e12,  # Convert Hz to THz
+                "num_slots": specs["num_spectrum_resources"],
+                "noise_figure_db": specs["noise_figure"],
+                "attenuation_db_km": specs["attenuation"]
+            }
             topology = get_topology(
                 topology_path,
                 None,
@@ -550,7 +558,7 @@ def main():
                     False,
                     0,
                     False,
-                    [specs],
+                    [band_spec],
                     args.debug
                 )
 
