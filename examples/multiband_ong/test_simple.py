@@ -176,7 +176,7 @@ def run_environment_with_monitoring(
             margin=margin,
             file_name=file_name,
             measure_disruptions=measure_disruptions,
-            k_paths=5 if topology.number_of_nodes() > 4 else 2,
+            k_paths=2,
             modulations_to_consider=5,
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
@@ -197,7 +197,7 @@ def run_environment_with_monitoring(
             margin=margin,
             file_name=file_name,
             measure_disruptions=measure_disruptions,
-            k_paths=5 if topology.number_of_nodes() > 4 else 2,
+            k_paths=2,
             modulations_to_consider=5,
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
@@ -360,7 +360,7 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=Tr
         allow_rejection=True,
         load=1000,
         episode_length=episode_length,
-        launch_power_dbm=0,  # Aumentado de 0 para 10 dBm (10 mW)
+        launch_power_dbm=0,
         frequency_slot_bandwidth=12.5e9,
         bit_rate_selection="discrete",
         bit_rates=(48, 120),
@@ -494,7 +494,7 @@ def main():
             100,  # max_span_length
             0.2,  # default_attenuation
             4.5,  # default_noise_figure
-            5 if topology_path.find("nobel-eu") == -1 else 2  # k_paths
+            2  # k_paths
         )
         
         monitor_file = None

@@ -110,7 +110,7 @@ def get_path_weight(graph, path, weight="length"):
 
 def get_best_modulation_format_by_length(
     length: float, modulations: Sequence[Modulation]
-) -> Modulation:
+) -> Optional[Modulation]:
     # sorts modulation from the most to the least spectrally efficient
     sorted_modulations = sorted(
         modulations, key=lambda x: x.spectral_efficiency, reverse=True
@@ -317,8 +317,7 @@ def get_topology(
 
                 if modulations is not None:
                     selected_modulations = [
-                        get_best_modulation_format(length, modulations)
-                        for length in lengths
+                        get_best_modulation_format_by_length(length, modulations)
                     ]
                 else:
                     selected_modulations = [None for _ in lengths]
@@ -367,17 +366,3 @@ def get_topology(
         topology.nodes[node]["index"] = idx
     return topology
 
-
-def get_best_modulation_format(
-    length: float, modulations: Sequence[Modulation]
-) -> Modulation:
-    # sorts modulation from the most to the least spectrally efficient
-    sorted_modulations = sorted(
-        modulations, key=lambda x: x.spectral_efficiency, reverse=True
-    )
-    for i in range(len(modulations)):
-        if length <= sorted_modulations[i].maximum_length:
-            return sorted_modulations[i]
-    raise ValueError(
-        "It was not possible to find a suitable MF for a path with {} km".format(length)
-    )

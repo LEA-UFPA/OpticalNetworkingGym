@@ -54,13 +54,7 @@ cur_modulations: Tuple[Modulation] = (
     # the first (lowest efficiency) modulation format needs to have maximum length
     # greater or equal to the longest path in the topology.
     # Here we put 100,000 km to be on the safe side
-    Modulation(
-        name="BPSK",
-        maximum_length=100_000,
-        spectral_efficiency=1,
-        minimum_osnr=12.6,
-        inband_xt=-14,
-    ),
+    
     Modulation(
         name="QPSK",
         maximum_length=2_000,
