@@ -1407,12 +1407,20 @@ cdef class QRMSAEnv:
 
                 osnr, ase, nli = calculate_osnr(self, self.current_service)
 
+                # DEBUG: Print resultado do cálculo de OSNR
+                print(f"[DEBUG QRMSA] Service {self.current_service.service_id} - OSNR: {osnr:.2f} dB, ASE: {ase:.2f} dB, NLI: {nli:.2f} dB")
+                print(f"[DEBUG QRMSA] Required OSNR: {osnr_req:.2f} dB, Modulation: {modulation.name}")
+                
+                # DEBUG ESPECÍFICO: Print do valor que vai para o info
+                print(f"[DEBUG INFO OSNR] *** VALOR QUE VAI PARA INFO: osnr = {osnr:.6f} dB ***")
+
                 if osnr >= osnr_req:
                     self.current_service.accepted = True
                     self.current_service.OSNR = osnr
                     self.current_service.ASE = ase
                     self.current_service.NLI = nli
                     self.current_service.current_modulation = modulation
+                    print(f"[DEBUG QRMSA] ✅ Service {self.current_service.service_id} ACCEPTED - OSNR suficiente!")
                     self.spectrum_efficiency_metric += modulation.spectral_efficiency
                     self.episode_modulation_histogram[modulation.spectral_efficiency] += 1
                     self._provision_path(path, initial_slot, number_slots)
@@ -1422,6 +1430,7 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
+                    print(f"[DEBUG QRMSA] ❌ Service {self.current_service.service_id} BLOCKED - OSNR insuficiente!")
                     self.bl_osnr += 1
             else:
                 self.current_service.accepted = False
@@ -1493,6 +1502,10 @@ cdef class QRMSAEnv:
             reward = self.reward()
         else:
             reward = -6.0
+            
+        # DEBUG ESPECÍFICO: Confirmar valor antes de colocar no info
+        print(f"[DEBUG INFO OSNR] *** CONFIRMANDO ANTES DO INFO: osnr = {osnr:.6f} dB, osnr_req = {osnr_req:.6f} dB ***")
+        
         info = {
             "episode_services_accepted": self.episode_services_accepted,
             "service_blocking_rate": 0.0,
@@ -2104,6 +2117,9 @@ cdef class QRMSAEnv:
                 service.OSNR = osnr
                 service.ASE = ase
                 service.NLI = nli
+                
+                # DEBUG: Print OSNR atribuído ao serviço
+                print(f"[DEBUG QRMSA] Service {service.service_id} final OSNR: {osnr:.2f} dB, ASE: {ase:.2f} dB, NLI: {nli:.2f} dB")
 
                 moved += 1
                 self.episode_service_realocations += 1

@@ -199,10 +199,17 @@ def heuristic_from_mask(env: Env, mask: np.ndarray) -> int:
 
         # Calcula o OSNR e valida
         osnr, _, _ = calculate_osnr(qrmsa_env, service)
-        # print(f"OSNR calculado para ação {action_index}: {osnr:.2f}")
+        
+        # DEBUG: Print OSNR calculado na heurística
+        print(f"[DEBUG HEURISTIC] Action {action_index} - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}")
 
         threshold = modulation.minimum_osnr + qrmsa_env.margin
         osnr_valid = osnr >= threshold
+        
+        if osnr_valid:
+            print(f"[DEBUG HEURISTIC] ✅ Action {action_index} - OSNR válido!")
+        else:
+            print(f"[DEBUG HEURISTIC] ❌ Action {action_index} - OSNR insuficiente! Required: {threshold:.2f} dB")
         if not osnr_valid:
             assert mask[action_index] == 0, (
                 f"Erro: Ação {action_index} bloqueada por OSNR, mas marcada como válida na máscara."
@@ -272,8 +279,13 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             service.launch_power = sim_env.launch_power
             
             osnr, _, _ = calculate_osnr(sim_env, service)
+            
+            # DEBUG: Print OSNR na heurística shortest_available_path_first_fit_best_modulation
+            print(f"[DEBUG HEURISTIC] shortest_available_path_first_fit_best_modulation - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}")
+            
             threshold = modulation.minimum_osnr + sim_env.margin
             if osnr >= threshold:
+                print(f"[DEBUG HEURISTIC] ✅ shortest_available_path_first_fit_best_modulation - OSNR válido!")
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
                 return action_index, False, False 
             else:
@@ -874,9 +886,14 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 # Verificar OSNR
                 try:
                     osnr, _, _ = calculate_osnr(sim_env, service)
+                    
+                    # DEBUG: Print OSNR na heurística multibanda
+                    print(f"[DEBUG HEURISTIC] multiband_best_modulation - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}, Band: {band.name}")
+                    
                     threshold = modulation.minimum_osnr + sim_env.margin
                     
                     if osnr >= threshold:
+                        print(f"[DEBUG HEURISTIC] ✅ multiband_best_modulation - OSNR válido!")
                         # Calcular action index corretamente
                         action_index = get_multiband_action_index(
                             sim_env, path_idx, band_idx, modulation_idx, slot_in_band

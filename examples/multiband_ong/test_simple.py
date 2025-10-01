@@ -85,7 +85,7 @@ def define_modulations() -> Tuple[Modulation, ...]:
         
         Modulation( 
             name="QPSK",
-            maximum_length=2_000,
+            maximum_length=10_000,
             spectral_efficiency=2,
             minimum_osnr=6.72,
             inband_xt=-17,
@@ -103,20 +103,6 @@ def define_modulations() -> Tuple[Modulation, ...]:
             spectral_efficiency=4,
             minimum_osnr=13.24,
             inband_xt=-23,
-        ),
-        Modulation(
-            name="32QAM",
-            maximum_length=250,
-            spectral_efficiency=5,
-            minimum_osnr=16.16,
-            inband_xt=-26,
-        ),
-        Modulation(
-            name="64QAM",
-            maximum_length=125,
-            spectral_efficiency=6,
-            minimum_osnr=19.01,
-            inband_xt=-29,
         ),
     )
 
@@ -249,7 +235,10 @@ def run_environment_with_monitoring(
                     # Debug visual - mostrar slots antes da alocação
                     if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
                         print_link_slots(env, "ANTES DA ALOCAÇÃO")
-                        print(f"\nCurrent service: {env.env.current_service}")
+                        print(f"\n[DEBUG TEST] Current service: {env.env.current_service}")
+                        if hasattr(env.env.current_service, 'service_id'):
+                            print(f"[DEBUG TEST] Service ID: {env.env.current_service.service_id}, Source: {env.env.current_service.source}, Destination: {env.env.current_service.destination}")
+                            print(f"[DEBUG TEST] Bit rate: {env.env.current_service.bit_rate}, Path: {env.env.current_service.path.node_list if hasattr(env.env.current_service.path, 'node_list') else 'N/A'}")
                     
                     action, path_id, mod_id = fn_heuristic(env)
                     obs, reward, done, truncated, info = env.step(action)
@@ -281,9 +270,14 @@ def run_environment_with_monitoring(
                 row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}"
                 mean_gsnr = 0.0
                 if len(env.env.topology.graph["services"]) > 0:
+                    # DEBUG: Print valores de OSNR dos serviços
+                    print(f"\n[DEBUG TEST] === OSNR dos Serviços no Episódio {ep} ===")
                     for service in env.env.topology.graph["services"]:
+                        print(f"[DEBUG TEST] Service {service.service_id}: OSNR={service.OSNR:.2f} dB, ASE={service.ASE:.2f} dB, NLI={service.NLI:.2f} dB")
+                        print(f"[DEBUG TEST]   Path: {service.path.node_list if hasattr(service.path, 'node_list') else 'N/A'}, Modulation: {service.current_modulation.name if service.current_modulation else 'None'}")
                         mean_gsnr += service.OSNR
                     mean_gsnr /= len(env.env.topology.graph["services"])
+                    print(f"[DEBUG TEST] OSNR médio: {mean_gsnr:.2f} dB")
                 row += f",{mean_gsnr}\n"
                 file_handler.write(row)
 
@@ -303,7 +297,10 @@ def run_environment_with_monitoring(
                 if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
                     print(f"[DEBUG] Executando debug para ep={ep}, step={step_count}")
                     print_link_slots(env, "ANTES DA ALOCAÇÃO")
-                    print(f"\nCurrent service: {env.env.current_service}")
+                    print(f"\n[DEBUG TEST] Current service: {env.env.current_service}")
+                    if hasattr(env.env.current_service, 'service_id'):
+                        print(f"[DEBUG TEST] Service ID: {env.env.current_service.service_id}, Source: {env.env.current_service.source}, Destination: {env.env.current_service.destination}")
+                        print(f"[DEBUG TEST] Bit rate: {env.env.current_service.bit_rate}, Path: {env.env.current_service.path.node_list if hasattr(env.env.current_service.path, 'node_list') else 'N/A'}")
                 
                 action, path_id, mod_id = fn_heuristic(env)
                 obs, reward, done, truncated, info = env.step(action)
@@ -318,6 +315,15 @@ def run_environment_with_monitoring(
             
             print(f"Episódio {ep + 1} finalizado com {step_count} steps.")
             print(f"Info: {info}")
+            
+            # DEBUG: Print valores de OSNR dos serviços (modo sem monitoramento)
+            if len(env.env.topology.graph["services"]) > 0:
+                print(f"\n[DEBUG TEST] === OSNR dos Serviços no Episódio {ep + 1} (SEM MONITORAMENTO) ===")
+                for service in env.env.topology.graph["services"]:
+                    print(f"[DEBUG TEST] Service {service.service_id}: OSNR={service.OSNR:.2f} dB, ASE={service.ASE:.2f} dB, NLI={service.NLI:.2f} dB")
+                    print(f"[DEBUG TEST]   Path: {service.path.node_list if hasattr(service.path, 'node_list') else 'N/A'}, Modulation: {service.current_modulation.name if service.current_modulation else 'None'}")
+                mean_gsnr = sum(service.OSNR for service in env.env.topology.graph["services"]) / len(env.env.topology.graph["services"])
+                print(f"[DEBUG TEST] OSNR médio: {mean_gsnr:.2f} dB")
 
 def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=True):
     """Cria o ambiente de teste baseado na configuração do graph_load.py"""
@@ -397,7 +403,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=100000,
+        default=1000,
         help='Número de chegadas por episódio (default: 10)'
     )
     parser.add_argument(
@@ -425,7 +431,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-l', '--load',
         type=float,
-        default=1000.0,
+        default=300.0,
         help='Carga da simulação (default: 1000.0)'
     )
     parser.add_argument(
