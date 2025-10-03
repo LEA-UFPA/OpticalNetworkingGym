@@ -554,7 +554,7 @@ cdef class QRMSAEnv:
         
         # Configurar basic parameters necessários para _init_bands
         self.k_paths = k_paths
-        self.modulations = list(reversed(self.topology.graph.get("modulations", [])))
+        self.modulations = list(self.topology.graph.get("modulations", []))
         self.max_modulation_idx = len(self.modulations) - 1
         self.modulations_to_consider = min(modulations_to_consider, len(self.modulations))
         self.frequency_slot_bandwidth = frequency_slot_bandwidth  # Necessário antes de _init_bands
@@ -1375,6 +1375,7 @@ cdef class QRMSAEnv:
             
             band = self.bands[band_idx]
             modulation = self.modulations[modulation_idx]
+
             osnr_req = modulation.minimum_osnr + self.margin
             path = self.k_shortest_paths[
                 self.current_service.source,
@@ -1408,11 +1409,11 @@ cdef class QRMSAEnv:
                 osnr, ase, nli = calculate_osnr(self, self.current_service)
 
                 # DEBUG: Print resultado do cálculo de OSNR
-                print(f"[DEBUG QRMSA] Service {self.current_service.service_id} - OSNR: {osnr:.2f} dB, ASE: {ase:.2f} dB, NLI: {nli:.2f} dB")
-                print(f"[DEBUG QRMSA] Required OSNR: {osnr_req:.2f} dB, Modulation: {modulation.name}")
+                #print(f"[DEBUG QRMSA] Service {self.current_service.service_id} - OSNR: {osnr:.2f} dB, ASE: {ase:.2f} dB, NLI: {nli:.2f} dB")
+                #print(f"[DEBUG QRMSA] Required OSNR: {osnr_req:.2f} dB, Modulation: {modulation.name}")
                 
                 # DEBUG ESPECÍFICO: Print do valor que vai para o info
-                print(f"[DEBUG INFO OSNR] *** VALOR QUE VAI PARA INFO: osnr = {osnr:.6f} dB ***")
+                #print(f"[DEBUG INFO OSNR] *** VALOR QUE VAI PARA INFO: osnr = {osnr:.6f} dB ***")
 
                 if osnr >= osnr_req:
                     self.current_service.accepted = True
@@ -1420,7 +1421,7 @@ cdef class QRMSAEnv:
                     self.current_service.ASE = ase
                     self.current_service.NLI = nli
                     self.current_service.current_modulation = modulation
-                    print(f"[DEBUG QRMSA] ✅ Service {self.current_service.service_id} ACCEPTED - OSNR suficiente!")
+                    #print(f"[DEBUG QRMSA] ✅ Service {self.current_service.service_id} ACCEPTED - OSNR suficiente!")
                     self.spectrum_efficiency_metric += modulation.spectral_efficiency
                     self.episode_modulation_histogram[modulation.spectral_efficiency] += 1
                     self._provision_path(path, initial_slot, number_slots)
@@ -1430,7 +1431,7 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
-                    print(f"[DEBUG QRMSA] ❌ Service {self.current_service.service_id} BLOCKED - OSNR insuficiente!")
+                    #print(f"[DEBUG QRMSA] ❌ Service {self.current_service.service_id} BLOCKED - OSNR insuficiente!")
                     self.bl_osnr += 1
             else:
                 self.current_service.accepted = False
@@ -1504,7 +1505,7 @@ cdef class QRMSAEnv:
             reward = -6.0
             
         # DEBUG ESPECÍFICO: Confirmar valor antes de colocar no info
-        print(f"[DEBUG INFO OSNR] *** CONFIRMANDO ANTES DO INFO: osnr = {osnr:.6f} dB, osnr_req = {osnr_req:.6f} dB ***")
+        #print(f"[DEBUG INFO OSNR] *** CONFIRMANDO ANTES DO INFO: osnr = {osnr:.6f} dB, osnr_req = {osnr_req:.6f} dB ***")
         
         info = {
             "episode_services_accepted": self.episode_services_accepted,

@@ -44,11 +44,11 @@ cpdef calculate_osnr(env: QRMSAEnv, current_service: object, qot_constraint: str
     cdef object link
     cdef object span
     cdef object running_service
-    print(f"[DEBUG OSNR] Calculating OSNR for Service ID: {current_service.service_id}")
-    print(f"[DEBUG OSNR] Service : {current_service}")
-    print(f"[DEBUG OSNR] QOT Constraint: {qot_constraint}")
-    print(f"band values: att={current_service.current_band.attenuation_normalized}, nf={current_service.current_band.noise_figure_normalized}")
-    print(f"launch power (W): {current_service.launch_power}")
+    # print(f"[DEBUG OSNR] Calculating OSNR for Service ID: {current_service.service_id}")
+    # print(f"[DEBUG OSNR] Service : {current_service}")
+    # print(f"[DEBUG OSNR] QOT Constraint: {qot_constraint}")
+    # print(f"band values: att={current_service.current_band.attenuation_normalized}, nf={current_service.current_band.noise_figure_normalized}")
+    # print(f"launch power (W): {current_service.launch_power}")
 
     for link in current_service.path.links:
         if hasattr(env, 'topo_cache') and env.topo_cache is not None:
