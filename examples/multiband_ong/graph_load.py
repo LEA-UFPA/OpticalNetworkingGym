@@ -1,15 +1,6 @@
-import argparse
-import logging
 import os
-import random
-from typing import List, Tuple
-from multiprocessing import Pool
-
-import numpy as np
 import time
 from datetime import datetime
-from tqdm import tqdm
-
 from optical_networking_gym.topology import Modulation, get_topology
 
 # ===================================================
@@ -164,37 +155,14 @@ def run_environment(
 
     # Criação do ambiente
     env = QRMSAEnvWrapper(**env_args)
-    env.reset()
+    monitor_file_name = f"load_results_{topology.name}_{load}.csv"
+    os.makedirs("results", exist_ok=True)
+    
+    with open(f"results/{monitor_file_name}", "wt") as f:
+        f.write(f"# Date: {datetime.now()}\n")
+        f.write("episode,service_blocking_rate,bit_rate_blocking_rate\n")
 
-    if monitor_file_name is None:
-        raise ValueError("Missing monitor file name")
-
-    # Definição do nome final do arquivo CSV de monitoramento
-    monitor_final_name = "_".join([
-        monitor_file_name, 
-        topology.name, 
-        str(env.env.launch_power_dbm), 
-        str(env.env.load) + "_nw_cnr_nobel-eu.csv"
-    ])
-
-    # Crie o diretório se não existir
-    os.makedirs(os.path.dirname(monitor_final_name), exist_ok=True)
-
-    # Preparação do arquivo CSV
-    with open(monitor_final_name, "wt", encoding="UTF-8") as file_handler:
-        file_handler.write(f"# Date: {datetime.now()}\n")
-        header = (
-            "episode,service_blocking_rate,episode_service_blocking_rate,"
-            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate, episode_service_realocations, episode_defrag_cicles"
-        )
-        for mf in env.env.modulations:
-            header += f",modulation_{mf.spectral_efficiency}"
-        header += ",episode_disrupted_services,episode_time,"
-        header += "mean_gsnr\n"
-        file_handler.write(header)
-
-        # Execução dos episódios
-        for ep in range(n_eval_episodes):
+        for ep in range(5):
             obs, info = env.reset()
             done = False
             start_time = time.time()

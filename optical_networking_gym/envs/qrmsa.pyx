@@ -31,8 +31,8 @@ cdef class Band:
     cdef public str name
     cdef public double start_thz
     cdef public int num_slots
-    cdef public double noise_figure_db
-    cdef public double attenuation_db_km
+    cdef public double noise_figure_normalized
+    cdef public double attenuation_normalized
     cdef public double slot_bw_hz
     
     # Atributos derivados
@@ -51,8 +51,8 @@ cdef class Band:
         self.name = name
         self.start_thz = start_thz
         self.num_slots = num_slots
-        self.noise_figure_db = noise_figure_db
-        self.attenuation_db_km = attenuation_db_km
+        self.noise_figure_normalized = 10 ** (noise_figure_db / 10) 
+        self.attenuation_normalized = attenuation_db_km / (2 * 10 * np.log10(np.exp(1)) * 1e3)
         self.slot_bw_hz = slot_bw_hz
         
         # Calcular atributos derivados
@@ -100,7 +100,7 @@ cdef class Band:
     def __repr__(self):
         return (f"Band(name='{self.name}', start_thz={self.start_thz}, "
                 f"num_slots={self.num_slots}, slot_range=[{self.slot_start}, {self.slot_end}), "
-                f"noise_figure_db={self.noise_figure_db}, attenuation_db_km={self.attenuation_db_km})")
+                f"noise_figure_db={self.noise_figure_normalized}, attenuation_db_km={self.attenuation_normalized})")
 
 cdef class FastPathOps:
     """Operações vetorizadas rápidas para provisão e liberação de caminhos"""
