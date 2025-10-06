@@ -35,9 +35,9 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(1000, 8001, 1000)
+        return np.arange(300, 1401, 50)  # Usando valores seguros do graph_load.py
     elif topology_name == "germany50.xml":
-        return np.arange(300, 801, 50)
+        return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
         return np.arange(100, 601, 50)
     elif topology_name == "nsfnet_chen.txt":
@@ -82,7 +82,13 @@ np.random.seed(seed)
 
 def define_modulations() -> Tuple[Modulation, ...]:
     return (
-        
+        Modulation(
+            name="BPSK",
+            maximum_length=100_000,
+            spectral_efficiency=1,
+            minimum_osnr=3.71,
+            inband_xt=-14,
+        ),
         Modulation( 
             name="QPSK",
             maximum_length=10_000,
@@ -104,16 +110,21 @@ def define_modulations() -> Tuple[Modulation, ...]:
             minimum_osnr=13.24,
             inband_xt=-23,
         ),
+        Modulation(
+            name="32QAM",
+            maximum_length=250,
+            spectral_efficiency=5,
+            minimum_osnr=16.16,
+            inband_xt=-26,
+        ),
+        Modulation(
+            name="64QAM",
+            maximum_length=125,
+            spectral_efficiency=6,
+            minimum_osnr=19.01,
+            inband_xt=-29,
+        ),
     )
-
-
-def print_link_slots(env, stage):
-    """Função para debug visual dos slots nos links"""
-    print(f"\n=== LINKS {stage} ===")
-    for u, v in env.env.topology.edges():
-        idx = env.env.topology[u][v]["index"]
-        slots = env.env.topology.graph["available_slots"][idx]
-        print(f"Link {u}->{v} slots: {''.join(map(str, slots.tolist()))}")
 
 def run_environment_with_monitoring(
     n_eval_episodes: int,
@@ -142,9 +153,7 @@ def run_environment_with_monitoring(
     Baseado na função run_environment do graph_load.py
     """
     
-    print(f"\n[DEBUG] Função run_environment_with_monitoring chamada com debug={debug}")
-    print(f"[DEBUG] monitor_file_name={monitor_file_name}")
-    print(f"[DEBUG] n_eval_episodes={n_eval_episodes}")
+
     
     # Configurações do ambiente - Usando band_specs diretamente se fornecido
     if band_specs:
@@ -163,10 +172,10 @@ def run_environment_with_monitoring(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=2,
-            modulations_to_consider=5,
+            modulations_to_consider=6,  # Fixo em 6 como no graph_load.py
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
-            gen_observation=gen_observation,
+            gen_observation=False,  # Forçar False para evitar problemas com high load
         )
     else:
         # Configuração tradicional (backward compatibility)
@@ -184,10 +193,10 @@ def run_environment_with_monitoring(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=2,
-            modulations_to_consider=5,
+            modulations_to_consider=6,  # Fixo em 6 como no graph_load.py
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
-            gen_observation=gen_observation,
+            gen_observation=False,  # Forçar False para evitar problemas com high load
         )
 
     # Seleção da heurística baseada no índice
@@ -195,135 +204,64 @@ def run_environment_with_monitoring(
 
     # Criação do ambiente
     env = QRMSAEnvWrapper(**env_args)
-    env.reset()
+    
+    # Criar arquivo CSV igual ao graph_load.py
+    monitor_final_name = f"load_results_{topology.name}_{load}.csv"
+    os.makedirs("results", exist_ok=True)
+    
+    with open(f"results/{monitor_final_name}", "wt") as f:
+        f.write(f"# Date: {datetime.now()}\n")
+        # Cabeçalho completo igual ao que é salvo nos dados
+        header = (
+            "episode,service_blocking_rate,episode_service_blocking_rate,"
+            "bit_rate_blocking_rate,episode_bit_rate_blocking_rate,"
+            "episode_service_realocations,episode_defrag_cicles"
+        )
+        for mf in env.env.modulations:
+            header += f",modulation_{mf.spectral_efficiency}"
+        header += ",episode_disrupted_services,episode_time,mean_gsnr\n"
+        f.write(header)
 
-    if monitor_file_name:
-        # Definição do nome final do arquivo CSV de monitoramento
-        monitor_final_name = "_".join([
-            monitor_file_name, 
-            topology.name, 
-            str(env.env.launch_power_dbm), 
-            str(env.env.load) + "_test_simple.csv"
-        ])
-
-        # Crie o diretório se não existir
-        os.makedirs(os.path.dirname(monitor_final_name), exist_ok=True)
-
-        # Preparação do arquivo CSV
-        with open(monitor_final_name, "wt", encoding="UTF-8") as file_handler:
-            file_handler.write(f"# Date: {datetime.now()}\n")
-            header = (
-                "episode,service_blocking_rate,episode_service_blocking_rate,"
-                "bit_rate_blocking_rate,episode_bit_rate_blocking_rate, episode_service_realocations, episode_defrag_cicles"
-            )
-            for mf in env.env.modulations:
-                header += f",modulation_{mf.spectral_efficiency}"
-            header += ",episode_disrupted_services,episode_time,"
-            header += "mean_gsnr\n"
-            file_handler.write(header)
-
-            # Execução dos episódios
-            for ep in range(n_eval_episodes):
-                obs, info = env.reset()
-                done = False
-                start_time = time.time()
-                step_count = 0
-                
-                print(f"\n=== EPISÓDIO {ep + 1}/{n_eval_episodes} ===")
-                
-                while not done:
-                    # Debug visual - mostrar slots antes da alocação
-                    if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
-                        print_link_slots(env, "ANTES DA ALOCAÇÃO")
-                        print(f"\n[DEBUG TEST] Current service: {env.env.current_service}")
-                        if hasattr(env.env.current_service, 'service_id'):
-                            print(f"[DEBUG TEST] Service ID: {env.env.current_service.service_id}, Source: {env.env.current_service.source}, Destination: {env.env.current_service.destination}")
-                            print(f"[DEBUG TEST] Bit rate: {env.env.current_service.bit_rate}, Path: {env.env.current_service.path.node_list if hasattr(env.env.current_service.path, 'node_list') else 'N/A'}")
-                    
-                    action, path_id, mod_id = fn_heuristic(env)
-                    obs, reward, done, truncated, info = env.step(action)
-                    
-                    # Debug visual - mostrar slots depois da alocação
-                    if debug and ep == 0 and step_count < 5:
-                        print_link_slots(env, "DEPOIS DA ALOCAÇÃO")
-                        print(f"Action taken: {action}")
-                        print("-" * 50)
-                    
-                    step_count += 1
-                    
-                end_time = time.time()
-                ep_time = end_time - start_time
-
-                print(f"Episódio {ep} finalizado.")
-                print(info)
-
-                row = (
-                    f"{ep},{info['service_blocking_rate']},"
-                    f"{info['episode_service_blocking_rate']},"
-                    f"{info['bit_rate_blocking_rate']},"
-                    f"{info['episode_bit_rate_blocking_rate']},"
-                    f"{info['episode_service_realocations']},"
-                    f"{info['episode_defrag_cicles']}"
-                )
-                for mf in env.env.modulations:
-                    row += f",{info.get(f'modulation_{mf.spectral_efficiency}', 0.0)}"
-                row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}"
-                mean_gsnr = 0.0
-                if len(env.env.topology.graph["services"]) > 0:
-                    # DEBUG: Print valores de OSNR dos serviços
-                    print(f"\n[DEBUG TEST] === OSNR dos Serviços no Episódio {ep} ===")
-                    for service in env.env.topology.graph["services"]:
-                        print(f"[DEBUG TEST] Service {service.service_id}: OSNR={service.OSNR:.2f} dB, ASE={service.ASE:.2f} dB, NLI={service.NLI:.2f} dB")
-                        print(f"[DEBUG TEST]   Path: {service.path.node_list if hasattr(service.path, 'node_list') else 'N/A'}, Modulation: {service.current_modulation.name if service.current_modulation else 'None'}")
-                        mean_gsnr += service.OSNR
-                    mean_gsnr /= len(env.env.topology.graph["services"])
-                    print(f"[DEBUG TEST] OSNR médio: {mean_gsnr:.2f} dB")
-                row += f",{mean_gsnr}\n"
-                file_handler.write(row)
-
-        print(f"\nFinalizado! Resultados salvos em: {monitor_final_name}")
-    else:
-        # Executar sem monitoramento
-        print(f"[DEBUG] Executando modo SEM monitoramento (debug={debug})")
         for ep in range(n_eval_episodes):
             obs, info = env.reset()
             done = False
+            start_time = time.time()
             step_count = 0
             
-            print(f"\n=== EPISÓDIO {ep + 1}/{n_eval_episodes} (SEM MONITORAMENTO) ===")
-            
             while not done:
-                # Debug visual - mostrar slots antes da alocação
-                if debug and ep == 0 and step_count < 5:  # Apenas primeiro episódio e primeiros 5 steps para não poluir
-                    print(f"[DEBUG] Executando debug para ep={ep}, step={step_count}")
-                    print_link_slots(env, "ANTES DA ALOCAÇÃO")
-                    print(f"\n[DEBUG TEST] Current service: {env.env.current_service}")
-                    if hasattr(env.env.current_service, 'service_id'):
-                        print(f"[DEBUG TEST] Service ID: {env.env.current_service.service_id}, Source: {env.env.current_service.source}, Destination: {env.env.current_service.destination}")
-                        print(f"[DEBUG TEST] Bit rate: {env.env.current_service.bit_rate}, Path: {env.env.current_service.path.node_list if hasattr(env.env.current_service.path, 'node_list') else 'N/A'}")
-                
                 action, path_id, mod_id = fn_heuristic(env)
                 obs, reward, done, truncated, info = env.step(action)
-                
-                # Debug visual - mostrar slots depois da alocação
-                if debug and ep == 0 and step_count < 5:
-                    print_link_slots(env, "DEPOIS DA ALOCAÇÃO")
-                    print(f"Action taken: {action}")
-                    print("-" * 50)
+
                 
                 step_count += 1
-            
-            print(f"Episódio {ep + 1} finalizado com {step_count} steps.")
-            print(f"Info: {info}")
-            
-            # DEBUG: Print valores de OSNR dos serviços (modo sem monitoramento)
+                
+            end_time = time.time()
+            ep_time = end_time - start_time
+
+            print(f"Episódio {ep} finalizado.")
+            print(info)
+
+            # Salvar dados no CSV exatamente como no graph_load.py
+            row = (
+                f"{ep},{info['service_blocking_rate']},"
+                f"{info['episode_service_blocking_rate']},"
+                f"{info['bit_rate_blocking_rate']},"
+                f"{info['episode_bit_rate_blocking_rate']},"
+                f"{info['episode_service_realocations']},"
+                f"{info['episode_defrag_cicles']}"
+            )
+            for mf in env.env.modulations:
+                row += f",{info.get(f'modulation_{mf.spectral_efficiency}', 0.0)}"
+            row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}"
+            mean_gsnr = 0.0
             if len(env.env.topology.graph["services"]) > 0:
-                print(f"\n[DEBUG TEST] === OSNR dos Serviços no Episódio {ep + 1} (SEM MONITORAMENTO) ===")
                 for service in env.env.topology.graph["services"]:
-                    print(f"[DEBUG TEST] Service {service.service_id}: OSNR={service.OSNR:.2f} dB, ASE={service.ASE:.2f} dB, NLI={service.NLI:.2f} dB")
-                    print(f"[DEBUG TEST]   Path: {service.path.node_list if hasattr(service.path, 'node_list') else 'N/A'}, Modulation: {service.current_modulation.name if service.current_modulation else 'None'}")
-                mean_gsnr = sum(service.OSNR for service in env.env.topology.graph["services"]) / len(env.env.topology.graph["services"])
-                print(f"[DEBUG TEST] OSNR médio: {mean_gsnr:.2f} dB")
+                    mean_gsnr += service.OSNR
+                mean_gsnr /= len(env.env.topology.graph["services"])
+            row += f",{mean_gsnr}\n"
+            f.write(row)
+
+    print(f"\nFinalizado! Resultados salvos em: results/{monitor_final_name}")
 
 def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=True):
     """Cria o ambiente de teste baseado na configuração do graph_load.py"""
@@ -340,7 +278,6 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=Tr
     
     # Usar modulações completas
     mods = define_modulations()
-    print("Usando modulações completas (6 modulações)")
     
     # Criar topologia
     topology = get_topology(
@@ -403,36 +340,25 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=1000,
-        help='Número de chegadas por episódio (default: 10)'
+        default=100000,
+        help='Número de chegadas por episódio (default: 100000)'
     )
     parser.add_argument(
         '-hi', '--heuristic_index',
         type=int,
-        default=1,
+        default=6,
         choices=[1, 2, 3, 4, 5, 6],
         help='Índice da heurística (1: First Fit, 2: Highest SNR, 3: Lowest Fragmentation, 4: Load Balancing, 5: Prioridade Banda C então L, 6: Multibanda Best Band)'
     )
-    parser.add_argument(
-        '-mf', '--monitor_file_name',
-        type=str,
-        default=None,
-        help='Nome base para o arquivo CSV de monitoramento (deixe vazio para não salvar)'
-    )
+
     parser.add_argument('-mb', '--bands', nargs='+', type=str, 
-                        default=['BandaC'],
+                        default=['BandaC+L'],
                         choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
                         help='Especifica uma ou mais bandas para simular')
     parser.add_argument(
         '-d', '--debug',
         action='store_true',
         help='Habilita debug visual dos slots'
-    )
-    parser.add_argument(
-        '-l', '--load',
-        type=float,
-        default=300.0,
-        help='Carga da simulação (default: 1000.0)'
     )
     parser.add_argument(
         '-p', '--power',
@@ -449,7 +375,6 @@ def main():
     
     # Usar modulações completas
     cur_modulations = define_modulations()
-    print("Usando modulações completas (5 modulações: QPSK, 8QAM, 16QAM, 32QAM, 64QAM)")
 
     # Determinar o caminho da topologia (caminho absoluto baseado no diretório do script)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -463,7 +388,7 @@ def main():
     if not os.path.exists(topology_path):
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
 
-    # Configurações de banda baseadas no graph_load.py
+    # Configurações de banda com slots uniformes
     if args.topology_file == "nobel-eu.xml":
         band_specs_options = {
             "BandaC": [{"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191}],
@@ -472,7 +397,6 @@ def main():
             "BandaC+L": [
                 {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
                 {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
-                {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
             ]
         }
     else:
@@ -486,10 +410,10 @@ def main():
             ]
         }
 
-    print(f"Bandas selecionadas para simulação: {args.bands}")
+    # Obter as cargas baseadas na topologia
+    loads = get_loads(args.topology_file)
 
     for band_name in args.bands:
-        print(f"\n--- Simulando banda: {band_name} ---")
         band_specs = band_specs_options[band_name]
         
         # Criar topologia
@@ -503,33 +427,31 @@ def main():
             2  # k_paths
         )
         
-        monitor_file = None
-        if args.monitor_file_name:
-            monitor_file = f"{args.monitor_file_name}_{band_name}"
-
-        # Executar simulação
-        run_environment_with_monitoring(
-            n_eval_episodes=args.num_episodes,
-            heuristic_index=args.heuristic_index,
-            monitor_file_name=monitor_file,
-            topology=topology,
-            seed=seed,
-            allow_rejection=True,
-            load=args.load,
-            episode_length=args.episode_length,
-            launch_power_dbm=args.power,  # Usar potência configurável
-            frequency_slot_bandwidth=12.5e9,
-            bit_rate_selection="discrete",
-            bit_rates=(48, 120),
-            margin=0,
-            file_name=f"service_logs/load_services_{band_name}_{args.load}.csv" if args.monitor_file_name else "",
-            measure_disruptions=False,
-            defragmentation=False,
-            n_defrag_services=0,
-            gen_observation=False,
-            band_specs=band_specs,
-            debug=args.debug
-        )
+        # Iterar sobre todas as cargas da topologia
+        for current_load in loads:
+            # Executar simulação
+            run_environment_with_monitoring(
+                n_eval_episodes=args.num_episodes,
+                heuristic_index=args.heuristic_index,
+                monitor_file_name=None,
+                topology=topology,
+                seed=seed,
+                allow_rejection=True,
+                load=current_load,
+                episode_length=args.episode_length,
+                launch_power_dbm=args.power,
+                frequency_slot_bandwidth=12.5e9,
+                bit_rate_selection="discrete",
+                bit_rates=(48, 120),
+                margin=0,
+                file_name="",
+                measure_disruptions=False,
+                defragmentation=False,
+                n_defrag_services=0,
+                gen_observation=False,
+                band_specs=band_specs,
+                debug=args.debug
+            )
 
     print("\nTodas as simulações foram executadas.")
 

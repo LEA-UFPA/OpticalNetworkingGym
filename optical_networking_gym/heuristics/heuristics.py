@@ -80,8 +80,17 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     # Converter o índice absoluto da modulação para o relativo
     relative_modulation_index = env.max_modulation_idx - modulation_index
     
-    # Obter número de slots por banda (assumindo bandas uniformes)
+    # CORREÇÃO CRÍTICA: O ambiente assume que todas as bandas têm o mesmo número de slots
+    # Para o cálculo da ação. Verificar se é realmente o caso ou usar o valor da primeira banda.
+    # Baseado no código do ambiente (line 1166 e 1363 em qrmsa.pyx):
     slots_per_band = env.bands[0].num_slots if env.bands else env.num_spectrum_resources
+    
+    # IMPORTANTE: O ambiente decodifica assumindo slots_per_band uniformes, então precisamos
+    # usar o mesmo valor aqui. Se a banda atual tem um número diferente de slots,
+    # precisamos validar se slot_in_band está dentro do range da primeira banda.
+    if slot_in_band >= slots_per_band:
+        raise ValueError(f"slot_in_band {slot_in_band} excede slots_per_band {slots_per_band} "
+                        f"para banda {band_index}. O ambiente assume bandas uniformes.")
     
     # Fórmula baseada na estrutura do action space:
     # action_space_size = (k_paths * num_bands * modulations_to_consider * slots_per_band) + 1
@@ -199,17 +208,9 @@ def heuristic_from_mask(env: Env, mask: np.ndarray) -> int:
 
         # Calcula o OSNR e valida
         osnr, _, _ = calculate_osnr(qrmsa_env, service)
-        
-        # DEBUG: Print OSNR calculado na heurística
-        print(f"[DEBUG HEURISTIC] Action {action_index} - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}")
 
         threshold = modulation.minimum_osnr + qrmsa_env.margin
         osnr_valid = osnr >= threshold
-        
-        if osnr_valid:
-            print(f"[DEBUG HEURISTIC] ✅ Action {action_index} - OSNR válido!")
-        else:
-            print(f"[DEBUG HEURISTIC] ❌ Action {action_index} - OSNR insuficiente! Required: {threshold:.2f} dB")
         if not osnr_valid:
             assert mask[action_index] == 0, (
                 f"Erro: Ação {action_index} bloqueada por OSNR, mas marcada como válida na máscara."
@@ -270,7 +271,28 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             service.initial_slot = candidate_start
             service.number_slots = required_slots
             service.current_modulation = modulation
-            service.center_frequency = (
+            
+            # Definir banda atual para ambientes multibanda
+            if hasattr(sim_env, 'bands') and sim_env.bands:
+                # Encontrar qual banda contém o slot inicial
+                for band in sim_env.bands:
+                    if band.contains_slot_range(candidate_start, required_slots):
+                        service.current_band = band
+                        service.center_frequency = band.center_frequency_hz_from_global(
+                            candidate_start, required_slots
+                        )
+                        break
+                else:
+                    # Se nenhuma banda contém o slot, usar a primeira banda como fallback
+                    service.current_band = sim_env.bands[0]
+                    service.center_frequency = (
+                        sim_env.frequency_start +
+                        (sim_env.frequency_slot_bandwidth * candidate_start) +
+                        (sim_env.frequency_slot_bandwidth * (required_slots / 2)))
+            else:
+                # Ambiente single-band tradicional
+                service.current_band = None
+                service.center_frequency = (
                         sim_env.frequency_start +
                         (sim_env.frequency_slot_bandwidth * candidate_start) +
                         (sim_env.frequency_slot_bandwidth * (required_slots / 2)))
@@ -280,12 +302,8 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             
             osnr, _, _ = calculate_osnr(sim_env, service)
             
-            # DEBUG: Print OSNR na heurística shortest_available_path_first_fit_best_modulation
-            print(f"[DEBUG HEURISTIC] shortest_available_path_first_fit_best_modulation - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}")
-            
             threshold = modulation.minimum_osnr + sim_env.margin
             if osnr >= threshold:
-                print(f"[DEBUG HEURISTIC] ✅ shortest_available_path_first_fit_best_modulation - OSNR válido!")
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
                 return action_index, False, False 
             else:
@@ -781,30 +799,102 @@ def try_allocate_in_band(sim_env, k_paths, band_idx):
             required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
             if required_slots <= 0:
                 continue
-            offset = sim_env.bands[band_idx].offset
-            num_slots = sim_env.bands[band_idx].num_slots
-            available_slots = sim_env.get_available_slots(path)[offset:offset+num_slots]
-            valid_starts = sim_env._get_candidates(available_slots, required_slots, num_slots)
+            
+            band = sim_env.bands[band_idx]
+            available_slots = sim_env.get_available_slots(path)
+            
+            # Usar _get_candidates_in_band para obter candidatos válidos na banda
+            try:
+                valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+            except Exception as e:
+                print(f"Erro ao chamar _get_candidates_in_band: {e}")
+                continue
+                
             if not valid_starts:
                 continue
-            candidate_start = valid_starts[0]
+            
+            # O valid_starts já retorna slots globais
+            global_candidate_start = valid_starts[0]
+            
+            # Verificar se o candidato global + required_slots está dentro da banda
+            global_candidate_end = global_candidate_start + required_slots
+            if not (band.slot_start <= global_candidate_start < band.slot_end and 
+                    band.slot_start < global_candidate_end <= band.slot_end):
+                continue
+            
+            # SIMPLIFICAÇÃO: usar diretamente o approach funcional do ambiente
+            # Como o ambiente assume slots uniformes, mapear global_candidate_start 
+            # para o slot relativo dentro da faixa da banda
+            slot_in_band = global_candidate_start - band.slot_start
+            
+            # Verificar se o slot relativo está dentro dos limites da banda atual
+            # CORREÇÃO: usar os limites da banda atual, não da primeira banda
+            if slot_in_band < 0 or slot_in_band >= band.num_slots:
+                continue
+            
+            # Verificação adicional: se ambiente assume slots uniformes, verificar se estamos dentro do limite uniforme
+            slots_per_band = sim_env.bands[0].num_slots if sim_env.bands else sim_env.num_spectrum_resources
+            if slot_in_band >= slots_per_band:
+                continue
+            
             service = sim_env.current_service
             service.path = path
-            service.initial_slot = candidate_start + offset
+            service.initial_slot = global_candidate_start
             service.number_slots = required_slots
             service.current_modulation = modulation
-            service.center_frequency = (
-                sim_env.bands[band_idx].frequency_start +
-                (sim_env.frequency_slot_bandwidth * candidate_start) +
-                (sim_env.frequency_slot_bandwidth * (required_slots / 2))
-            )
+            service.current_band = band
+            
+            # Calcular frequência central usando a banda
+            try:
+                service.center_frequency = band.center_frequency_hz_from_global(
+                    global_candidate_start, required_slots
+                )
+            except Exception as e:
+                print(f"Erro ao calcular frequência central: {e}")
+                # Fallback para cálculo tradicional
+                service.center_frequency = (
+                    sim_env.frequency_start +
+                    (sim_env.frequency_slot_bandwidth * global_candidate_start) +
+                    (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+                )
+            
             service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
             service.launch_power = sim_env.launch_power
-            osnr, _, _ = calculate_osnr(sim_env, service)
-            threshold = modulation.minimum_osnr + sim_env.margin
-            if osnr >= threshold:
-                action_index = get_action_index(sim_env, path_idx, modulation_idx, service.initial_slot)
-                return action_index, False, False
+            
+            # Verificar OSNR
+            try:
+                osnr, _, _ = calculate_osnr(sim_env, service)
+                threshold = modulation.minimum_osnr + sim_env.margin
+                
+                if osnr >= threshold:
+                    # Usar get_multiband_action_index diretamente
+                    action_index = get_multiband_action_index(
+                        sim_env, path_idx, band_idx, modulation_idx, slot_in_band
+                    )
+                    
+                    
+                    # Testar decodificação da ação para confirmar
+                    try:
+                        decoded = sim_env.decimal_to_array(action_index)
+                        
+                        # Verificar se o slot global está dentro da banda
+                        target_band = sim_env.bands[decoded[1]]
+                        calculated_global_slot = decoded[3]
+                        if not (target_band.slot_start <= calculated_global_slot < target_band.slot_end):
+                            continue
+                            
+                    except Exception as e:
+                        continue
+                    
+                    # Verificar se a ação está válida
+                    if action_index >= sim_env.action_space.n:
+                        print(f"ERRO: action_index {action_index} >= action_space.n {sim_env.action_space.n}")
+                        continue
+                    
+                    return action_index, False, False
+            except Exception as e:
+                print(f"Erro no cálculo de OSNR: {e}")
+                continue
     return None
 
 
@@ -850,13 +940,14 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 # Usar primeiro candidato (first-fit)
                 global_candidate_start = valid_starts[0]
                 
-                # Verificar se o slot está dentro da banda
-                if not band.contains_slot_range(global_candidate_start, required_slots):
-                    print(f"ERRO: Slot global {global_candidate_start} não está na banda {band.name}")
-                    continue
+                # SIMPLIFICAÇÃO: usar diretamente o approach funcional do ambiente
+                # Como o ambiente assume slots uniformes, mapear global_candidate_start 
+                # para o slot relativo dentro da faixa da banda
+                slot_in_band = global_candidate_start - band.slot_start
                 
-                # Converter para slot relativo na banda
-                slot_in_band = band.global_to_local(global_candidate_start)
+                # Verificar se o slot relativo está dentro dos limites da banda uniforme
+                if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+                    continue
                 
                 # Configurar o serviço para teste de OSNR
                 service = sim_env.current_service
@@ -887,17 +978,19 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 try:
                     osnr, _, _ = calculate_osnr(sim_env, service)
                     
-                    # DEBUG: Print OSNR na heurística multibanda
-                    print(f"[DEBUG HEURISTIC] multiband_best_modulation - OSNR: {osnr:.2f} dB, Modulation: {modulation.name}, Band: {band.name}")
-                    
                     threshold = modulation.minimum_osnr + sim_env.margin
                     
                     if osnr >= threshold:
-                        print(f"[DEBUG HEURISTIC] ✅ multiband_best_modulation - OSNR válido!")
                         # Calcular action index corretamente
                         action_index = get_multiband_action_index(
                             sim_env, path_idx, band_idx, modulation_idx, slot_in_band
                         )
+                        
+                        # Verificar se a ação está válida
+                        if action_index >= sim_env.action_space.n:
+                            print(f"ERRO: action_index {action_index} >= action_space.n {sim_env.action_space.n}")
+                            continue
+                        
                         return action_index, False, False
                     else:
                         blocked_due_to_osnr = True

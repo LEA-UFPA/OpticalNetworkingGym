@@ -770,10 +770,9 @@ cdef class QRMSAEnv:
         self.total_slots = current_offset
         
         
-        # Atualizar action_space para usar slots por banda (não total)
-        # Assumindo bandas uniformes de 10 slots cada
-        slots_per_band = self.bands[0].num_slots  # Usar primeira banda como referência
-        action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * slots_per_band) + 1
+        # Atualizar action_space para usar total_slots (consistente com decodificação)
+        # CORREÇÃO: usar total_slots para ser consistente com decimal_to_array
+        action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * self.total_slots) + 1
         self.action_space = gym.spaces.Discrete(action_space_size)
 
     cpdef Band band_for_global_slot(self, int global_slot):
