@@ -35,7 +35,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(300, 1401, 50)  
+        return np.arange(1400, 1401, 50)  
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -82,13 +82,6 @@ np.random.seed(seed)
 
 def define_modulations() -> Tuple[Modulation, ...]:
     return (
-        Modulation(
-            name="BPSK",
-            maximum_length=100_000,
-            spectral_efficiency=1,
-            minimum_osnr=3.71,
-            inband_xt=-14,
-        ),
         Modulation( 
             name="QPSK",
             maximum_length=10_000,
@@ -172,7 +165,7 @@ def run_environment_with_monitoring(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=2,
-            modulations_to_consider=6,  # Fixo em 6 como no graph_load.py
+            modulations_to_consider=2,  
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
             gen_observation=False,  # Forçar False para evitar problemas com high load

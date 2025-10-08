@@ -35,7 +35,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(1000, 8001, 1000)
+        return np.arange(10000, 18001, 1000)
     elif topology_name == "germany50.xml":
         return np.arange(300, 801, 50)
     elif topology_name == "janos-us.xml":
@@ -84,13 +84,6 @@ def define_modulations() -> Tuple[Modulation, ...]:
     # Modulations based on the paper "Aplicação do Algoritmo de Roteamento por Série de Potências..."
     # OSNR values are from snr_b in the paper (4-QAM to 64-QAM)
     return (
-        Modulation(
-            name="BPSK",
-            maximum_length=100000,
-            spectral_efficiency=1,
-            minimum_osnr=3.71,
-            inband_xt=-14,
-        ),
         Modulation(
             name="4-QAM",  # QPSK in the paper is 4-QAM
             maximum_length=10000,
@@ -206,7 +199,7 @@ def run_environment_with_monitoring(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=2,
-            modulations_to_consider=6,
+            modulations_to_consider=5,
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
             gen_observation=gen_observation,
@@ -429,7 +422,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=1000,
+        default=10000,
         help='Número de chegadas por episódio (default: 1000)'
     )
     parser.add_argument(
@@ -447,7 +440,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument('-mb', '--bands', nargs='+', type=str, 
                         default=['BandaC'],
-                        choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
+                        choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L', 'BandaC+L+S'],
                         help='Especifica uma ou mais bandas para simular')
     parser.add_argument(
         '-d', '--debug',
@@ -470,7 +463,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-th', '--threads',
         type=int,
-        default=10,
+        default=1,
         help='Número de threads para execução das simulações (default: 1)'
     )
 
@@ -505,6 +498,11 @@ def main():
         "BandaC+L": [
             {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
             {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+            {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
+        ],
+        "BandaC+L+S": [
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
             {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
         ]
     }

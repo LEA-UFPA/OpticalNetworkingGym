@@ -770,9 +770,12 @@ cdef class QRMSAEnv:
         self.total_slots = current_offset
         
         
-        # Atualizar action_space para usar total_slots (consistente com decodificação)
-        # CORREÇÃO: usar total_slots para ser consistente com decimal_to_array
-        action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * self.total_slots) + 1
+        # Atualizar action_space para usar slots por banda (consistente com decodificação)
+        # CORREÇÃO: usar self.bands[0].num_slots para ser consistente com decimal_to_array no step()
+        # O step() decodifica usando slots_per_band = self.bands[0].num_slots, então o action space
+        # deve ser criado com a mesma dimensão
+        action_space_size = (self.k_paths * self.num_bands * self.modulations_to_consider * self.bands[0].num_slots) + 1
+        print(f"[INFO] Action space size: {action_space_size} = ({self.k_paths} paths × {self.num_bands} bands × {self.modulations_to_consider} mods × {self.bands[0].num_slots} slots) + 1")
         self.action_space = gym.spaces.Discrete(action_space_size)
 
     cpdef Band band_for_global_slot(self, int global_slot):
@@ -1277,8 +1280,9 @@ cdef class QRMSAEnv:
 
     cpdef decimal_to_array(self, decimal: int, max_values=None):
         if max_values is None:
-            # Agora incluindo banda: [k_path, band_idx, mod_idx_relative, global_slot]
-            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.total_slots]
+            # Agora incluindo banda: [k_path, band_idx, mod_idx_relative, slot_relative]
+            # IMPORTANTE: Usar slots_per_band (não total_slots) para ser consistente com step()
+            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.bands[0].num_slots]
         
         array = []
         for max_val in reversed(max_values):
@@ -1293,15 +1297,26 @@ cdef class QRMSAEnv:
             allowed_mods = list(range(0, self.modulations_to_consider))
         
         original_mod = array[2]
+        
+        # Verificação de segurança
+        if original_mod >= len(allowed_mods):
+            print(f"[ERROR decimal_to_array] Modulation index error!")
+            print(f"  decimal={decimal}, max_values={max_values}")
+            print(f"  array={array}, original_mod={original_mod}")
+            print(f"  max_modulation_idx={self.max_modulation_idx}, modulations_to_consider={self.modulations_to_consider}")
+            print(f"  allowed_mods={allowed_mods}, len={len(allowed_mods)}")
+            print(f"  total modulations in env={len(self.modulations)}")
+            raise IndexError(f"Modulation index {original_mod} out of range for allowed_mods with length {len(allowed_mods)}")
+        
         array[2] = allowed_mods[array[2]]  # Ajustado para posição 2
         
-        # print(f"k:{self.k_shortest_paths[self.current_service.source,self.current_service.destination][array[0]]}, band: {self.bands[array[1]]}, mod: {self.modulations[array[2]]}, slot: {array[3]}")
         return array
 
     cpdef encoded_decimal_to_array(self, decimal: int, max_values=None):
         if max_values is None:
-            # Para multibanda, usar 4 dimensões: [k_path, band, modulation, slot]
-            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.total_slots]
+            # Para multibanda, usar 4 dimensões: [k_path, band, modulation, slot_per_band]
+            # IMPORTANTE: Usar slots_per_band (não total_slots) para ser consistente
+            max_values = [self.k_paths, self.num_bands, self.modulations_to_consider, self.bands[0].num_slots]
         
         array = []
         # Decomposição do número decimal com base nos valores máximos
