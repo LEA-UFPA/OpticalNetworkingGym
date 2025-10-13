@@ -89,7 +89,7 @@ class SimulationUtils:
             defragmentation=defragmentation,
             n_defrag_services=0,
             gen_observation= gen_observation,
-            qot_constraint="DIST"
+            qot_constraint="ASE+NLI"  # Usar OSNR+NLI ao invés de DIST
         )
 
     @staticmethod
@@ -131,7 +131,7 @@ class SimulationUtils:
 
                 while not done:
                     action = heuristic_fn(info['mask'])
-                    _, _, done, _, info = env.step(action)
+                    obs, _, done, _, info = env.step(action)
 
                 ep_time = time.time() - start
                 row = [

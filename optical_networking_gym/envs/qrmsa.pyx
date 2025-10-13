@@ -19,7 +19,7 @@ import numpy as np
 from collections import defaultdict
 from numpy.random import SeedSequence
 from optical_networking_gym.utils import rle, link_shannon_entropy_, fragmentation_route_cuts, fragmentation_route_rss
-from optical_networking_gym.core.osnr import calculate_osnr, calculate_osnr_observation
+from optical_networking_gym.core.osnr import calculate_osnr, calculate_osnr_observation, compute_slot_osnr_vectorized, validate_osnr_vectorized
 import math
 import typing
 import os
@@ -164,7 +164,7 @@ cdef class Service:
 cdef class QRMSAEnv:
     cdef public uint32_t input_seed
     cdef public double load
-    cdef int episode_length
+    cdef public int episode_length
     cdef double mean_service_holding_time
     cdef public int num_spectrum_resources
     cdef public double channel_width
@@ -242,12 +242,21 @@ cdef class QRMSAEnv:
     cdef dict path_nodes_cache 
     cdef public int max_modulation_idx
     cdef public int modulations_to_consider
+    
+    # Novos caches para observações slot-wise
+    cdef dict available_slots_cache
+    cdef dict available_slots_signature_cache
+    cdef dict block_info_cache
+    cdef dict osnr_matrix_cache
+    cdef dict fragmentation_cache
+    cdef dict slot_window_cache
     cdef int spectrum_efficiency_metric
     cdef bint defragmentation
     cdef int n_defrag_services
     cdef int episode_defrag_cicles
     cdef int episode_service_realocations
     cdef bint gen_observation
+    cdef public bint rl_mode
 
     topology: cython.declare(nx.Graph, visibility="readonly")
     bit_rate_selection: cython.declare(Literal["continuous", "discrete"], visibility="readonly")
@@ -284,10 +293,12 @@ cdef class QRMSAEnv:
         n_defrag_services: int = 0,
         gen_observation: bool = True,
         qot_constraint: str = "ASE+NLI",
+        rl_mode: bool = False,
     ):
         self.gen_observation = gen_observation
         self.defragmentation = defragmentation
         self.n_defrag_services = n_defrag_services
+        self.rl_mode = rl_mode
         self.rng = random.Random()
         self.blocks_to_consider = blocks_to_consider
         self.mean_service_inter_arrival_time = 0
@@ -370,16 +381,19 @@ cdef class QRMSAEnv:
             (self.k_paths * self.modulations_to_consider * self.num_spectrum_resources)+1
         )
 
+        # Nova estrutura otimizada: 3 + k_paths + (num_slots × 6) + (k_paths × num_slots × 6)
+        # Nova estrutura otimizada: basic + route_lengths + path/mod + global_slots + path/slots
         total_dim = (
-            1
-            + 2
-            + self.k_paths
-            + (self.k_paths * self.modulations_to_consider * 12)
+            1  # bit_rate apenas
+            + self.k_paths  # route lengths normalizadas
+            + (self.k_paths * self.modulations_to_consider * 2)  # path/modulation features
+            + (self.num_spectrum_resources * 4)  # features globais por slot (otimizadas)
+            + (self.k_paths * self.num_spectrum_resources * 3)  # features path/slot (otimizadas)
         )
-
+        
         self.observation_space = gym.spaces.Box(
-                low=-5,
-                high=5,
+                low=-1.0,  # Permitir -1 para slots indisponíveis
+                high=1.0,
                 shape=(total_dim,),
                 dtype=np.float32
             )
@@ -488,6 +502,14 @@ cdef class QRMSAEnv:
                         cache_key = (source, destination, i)
                         self.path_nodes_cache[cache_key] = list(path.node_list)
 
+        # Inicializar novos caches para observações slot-wise
+        self.available_slots_cache = {}
+        self.available_slots_signature_cache = {}
+        self.block_info_cache = {}
+        self.osnr_matrix_cache = {}
+        self.fragmentation_cache = {}
+        self.slot_window_cache = {}
+
     cpdef tuple reset(self, object seed=None, dict options=None):
         self.episode_bit_rate_requested = 0.0
         self.episode_bit_rate_provisioned = 0.0
@@ -537,6 +559,14 @@ cdef class QRMSAEnv:
         self.topology.graph["last_update"] = 0.0
 
         self.link_cache._initialize_cache()
+        
+        # Limpar caches para novas observações
+        self.available_slots_cache.clear()
+        self.available_slots_signature_cache.clear()
+        self.block_info_cache.clear()
+        self.osnr_matrix_cache.clear()
+        self.fragmentation_cache.clear()
+        self.slot_window_cache.clear()
         for lnk in self.topology.edges():
             self.topology[lnk[0]][lnk[1]]["utilization"] = 0.0
             self.topology[lnk[0]][lnk[1]]["last_update"] = 0.0
@@ -630,205 +660,653 @@ cdef class QRMSAEnv:
                             return
         self.max_modulation_idx = self.modulations_to_consider - 1
 
-    def observation(self):
+    def observation_optimized(self):
+        """Nova função observation com estrutura híbrida otimizada"""
         if not self.gen_observation:
-            obs    = np.zeros((self.observation_space.shape[0],), dtype=np.float32)
-            action_mask = np.zeros((self.action_space.n,),           dtype=np.uint8)
+            obs = np.zeros((self.observation_space.shape[0],), dtype=np.float32)
+            action_mask = np.zeros((self.action_space.n,), dtype=np.uint8)
             return obs, {'mask': action_mask}
-            
-        def compute_modulation_features(available_slots, num_slots_required, route_links, modulation):
-            valid_starts = self._get_candidates(available_slots, num_slots_required, self.num_spectrum_resources)
-            candidate_count = len(valid_starts)
-            feature_candidate_count = candidate_count / self.num_spectrum_resources
-            if candidate_count > 0:
-                avg_candidate = np.mean(valid_starts)
-                std_candidate = np.std(valid_starts)
-                max_candidate = max(valid_starts)
-            else:
-                avg_candidate = std_candidate = max_candidate = 0.0
-            feature_avg_candidate = avg_candidate / (self.num_spectrum_resources - 1)
-            feature_std_candidate = std_candidate / (self.num_spectrum_resources - 1)
-            feature_max_candidate = max_candidate / (self.num_spectrum_resources - 1)
-            
-            osnr_values = []
-            osnr_best = 0.0
-            for init_slot in valid_starts:
-                service_bandwidth = num_slots_required * self.channel_width * 1e9
-                service_center_frequency = (
-                    self.frequency_start +
-                    (self.channel_width * 1e9 * init_slot) +
-                    (self.channel_width * 1e9 * (num_slots_required / 2.0))
-                )
-                osnr_current = calculate_osnr_observation(
-                    self,
-                    route_links,
-                    service_bandwidth,
-                    service_center_frequency,
-                    self.current_service.service_id,
-                    10 ** ((self.launch_power_dbm - 30) / 10),
-                    modulation.minimum_osnr
-                )
-                osnr_values.append(osnr_current)
-                if osnr_current > osnr_best:
-                    osnr_best = osnr_current
-            if osnr_values:
-                osnr_mean = np.mean(osnr_values)
-                osnr_var = np.var(osnr_values)
-            else:
-                osnr_mean = osnr_var = 0.0
-            
-            adjusted_slots_required = max((num_slots_required - 5.5) / 3.5, 0.0)
-            
-            total_available_slots = np.sum(available_slots)
-            total_available_slots_ratio = 2.0 * (total_available_slots - 0.5 * self.num_spectrum_resources) / self.num_spectrum_resources
-            
-            blocks_sizes = []
-            current_len = 0
-            for slot in available_slots:
-                if slot == 1:
-                    current_len += 1
-                else:
-                    if current_len > 0:
-                        blocks_sizes.append(current_len)
-                    current_len = 0
-            if current_len > 0:
-                blocks_sizes.append(current_len)
-            if blocks_sizes:
-                mean_block_size = ((np.mean(blocks_sizes) - 4.0) / 4.0) / 100.0
-                std_block_size = (np.std(blocks_sizes) / 100.0)
-            else:
-                mean_block_size = std_block_size = 0.0
-            
-            link_usage_normalized = 2.0 * ((np.sum(available_slots) / self.num_spectrum_resources) - 0.5)
-            
-            features = [feature_candidate_count,
-                        feature_avg_candidate,
-                        feature_std_candidate,
-                        adjusted_slots_required,
-                        total_available_slots_ratio,
-                        mean_block_size,
-                        std_block_size,
-                        osnr_best,
-                        osnr_mean,
-                        osnr_var,
-                        link_usage_normalized,
-                        feature_max_candidate]
-            return valid_starts, features, osnr_values
-
+        
         # ========================
-        # Observações comuns
+        # ETAPA 1: Setup & Caching
         # ========================
         topology = self.topology
         current_service = self.current_service
         num_spectrum_resources = self.num_spectrum_resources
         k_shortest_paths = self.k_shortest_paths
-        modulations = self.modulations
-        num_mod_to_consider = self.modulations_to_consider
         num_nodes = topology.number_of_nodes()
-        frequency_slot_bandwidth = self.channel_width * 1e9
         max_bit_rate = max(self.bit_rates)
         self.get_max_modulation_index()
 
-        source_id = int(current_service.source_id)
-        destination_id = int(current_service.destination_id)
-        source_norm = source_id / (num_nodes - 1) if num_nodes > 1 else 0
-        destination_norm = destination_id / (num_nodes - 1) if num_nodes > 1 else 0
-        source_destination = np.array([source_norm, destination_norm], dtype=np.float32)
-
-        bit_rate_obs = np.array([current_service.bit_rate / max_bit_rate], dtype=np.float32)
-
-        num_paths_to_evaluate = self.k_paths
-        # Obter os comprimentos dos links para normalização das rotas
-        link_lengths = [topology[x][y]["length"] for x, y in topology.edges()]
-        min_length = min(link_lengths)
-        max_length = max(link_lengths)
-        route_lengths = np.zeros((num_paths_to_evaluate,), dtype=np.float32)
-
-        # Pré-cálculo das informações de cada caminho: (route, available_slots)
+        # Preparar informações dos caminhos
         paths_info = []
         source = current_service.source
         destination = current_service.destination
+        
         for path_index, route in enumerate(k_shortest_paths[source, destination]):
-            if path_index >= num_paths_to_evaluate:
+            if path_index >= self.k_paths:
                 break
-            normalized_length = self.normalize_value(route.length, min_length, max_length)
-            route_lengths[path_index] = normalized_length
-            available_slots = self.get_available_slots(route)
+            available_slots = self._get_cached_available_slots(route, f"path_{path_index}")
             paths_info.append((route, available_slots))
 
+        # Cache de utilizações por path
+        path_utilizations = self._compute_path_utilizations()
+        
         # ========================
-        # Cálculo das features de observação por (caminho, modulação)
+        # ETAPA 2: Action Mask (Reutilizar atual)
         # ========================
-        mod_features_obs = np.full((num_paths_to_evaluate * num_mod_to_consider, 12), fill_value=-1.0, dtype=np.float32)
-        mod_features_cache = {}
-        for p_idx in range(num_paths_to_evaluate):
-            route, available_slots = paths_info[p_idx]
-            start_index = 0 if self.max_modulation_idx <= 1 else max(0, self.max_modulation_idx - (num_mod_to_consider - 1))
-            mod_list = list(reversed(modulations[start_index: num_mod_to_consider + start_index]))
-            for m_idx in range(num_mod_to_consider):
-                modulation = mod_list[m_idx]
-                num_slots_required = self.get_number_slots(current_service, modulation)
-                valid_starts, features, osnr_values = compute_modulation_features(available_slots, num_slots_required, route.links, modulation)
-                mod_features_obs[p_idx * num_mod_to_consider + m_idx, :] = np.array(features, dtype=np.float32)
-                mod_features_cache[(p_idx, m_idx)] = (valid_starts, features, num_slots_required, modulation)
-
-        # ========================
-        # Geração da máscara de ações
-        # ========================
-        total_actions = num_paths_to_evaluate * num_mod_to_consider * num_spectrum_resources
+        total_actions = self.k_paths * self.modulations_to_consider * num_spectrum_resources
         action_mask = np.zeros(total_actions + 1, dtype=np.uint8)
-
+        
+        valid_actions = 0
+        path_modulations_cache = {}
+        path_window_masks = {}
+        
         for action_index in range(total_actions):
-            p_idx = action_index // (num_mod_to_consider * num_spectrum_resources)
-            mod_and_slot = action_index % (num_mod_to_consider * num_spectrum_resources)
+            p_idx = action_index // (self.modulations_to_consider * num_spectrum_resources)
+            mod_and_slot = action_index % (self.modulations_to_consider * num_spectrum_resources)
             m_idx = mod_and_slot // num_spectrum_resources
             init_slot = mod_and_slot % num_spectrum_resources
-
+            
+            if p_idx >= len(paths_info):
+                continue
+                
             route, available_slots = paths_info[p_idx]
-            # Recupera os dados de modulação do cache
-            valid_starts, features, num_slots_required, modulation = mod_features_cache[(p_idx, m_idx)]
+            cache_prefix = f"path_{p_idx}"
+            
+            if available_slots[init_slot] == 0:
+                continue
+                
+            if p_idx not in path_modulations_cache:
+                start_index = max(0, self.max_modulation_idx - (self.modulations_to_consider - 1))
+                path_modulations_cache[p_idx] = list(reversed(self.modulations[start_index: self.max_modulation_idx + 1][:self.modulations_to_consider]))
+            modulation_list = path_modulations_cache[p_idx]
+            if m_idx >= len(modulation_list):
+                continue
+            modulation = modulation_list[m_idx]
+            num_slots_required = self.get_number_slots(self.current_service, modulation)
+            
+            if init_slot + num_slots_required > num_spectrum_resources:
+                continue
+            
+            base_key = (p_idx, num_slots_required)
+            if base_key not in path_window_masks:
+                path_window_masks[base_key] = self._get_cached_window_mask(available_slots, cache_prefix, num_slots_required)
+            base_mask = path_window_masks[base_key]
+            if init_slot >= base_mask.shape[0] or base_mask[init_slot] == 0:
+                continue
+            
+            guard_needed = (init_slot + num_slots_required) < num_spectrum_resources
+            if guard_needed:
+                guard_window = num_slots_required + 1
+                guard_key = (p_idx, guard_window)
+                if guard_key not in path_window_masks:
+                    path_window_masks[guard_key] = self._get_cached_window_mask(available_slots, cache_prefix, guard_window)
+                guard_mask = path_window_masks[guard_key]
+                if init_slot >= guard_mask.shape[0] or guard_mask[init_slot] == 0:
+                    continue
+            
+            # QoT check
+            self.current_service.path = route
+            self.current_service.initial_slot = init_slot
+            self.current_service.number_slots = num_slots_required
+            self.current_service.center_frequency = (
+                self.frequency_start +
+                self.frequency_slot_bandwidth * (init_slot + num_slots_required / 2)
+            )
+            self.current_service.bandwidth = self.frequency_slot_bandwidth * num_slots_required
+            self.current_service.launch_power = self.launch_power
 
-            valid_action = False
-            osnr_current = 0.0
-            if init_slot in valid_starts:
-                service_bandwidth = num_slots_required * frequency_slot_bandwidth
-                service_center_frequency = (
-                    self.frequency_start +
-                    (frequency_slot_bandwidth * init_slot) +
-                    (frequency_slot_bandwidth * (num_slots_required / 2.0))
-                )
-                osnr_current = calculate_osnr_observation(
-                    self,
-                    route.links,
-                    service_bandwidth,
-                    service_center_frequency,
-                    current_service.service_id,
-                    10 ** ((self.launch_power_dbm - 30) / 10),
-                    modulation.minimum_osnr
-                )
-                if osnr_current >= 0:
-                    valid_action = True
-
-            if valid_action:
+            if self.qot_constraint == "DIST":
+                qot_acceptable = route.length <= modulation.maximum_length
+            else:
+                osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
+            
+            # Reset service
+            self.current_service.path = None
+            self.current_service.initial_slot = -1
+            self.current_service.number_slots = 0
+            self.current_service.center_frequency = 0.0
+            self.current_service.bandwidth = 0.0
+            self.current_service.launch_power = 0.0
+            
+            if qot_acceptable:
                 action_mask[action_index] = 1
-
-        # Define a ação dummy (última posição) como válida
-        action_mask[-1] = 1
+                valid_actions += 1
+        
+        action_mask[-1] = 1  # Reject action sempre válida
 
         # ========================
-        # Construção final da observação
+        # ETAPA 3: Basic Features & Route Lengths
         # ========================
-        # As features de ação agora vêm de mod_features_obs, que tem dimensão:
-        # (k_paths * modulations_to_consider, 12)
-        spectrum_obs_flat = mod_features_obs.flatten().astype(np.float32)
+        bit_rate_norm = current_service.bit_rate / max_bit_rate
+        basic_features = np.array([bit_rate_norm], dtype=np.float32)
+
+        # Route lengths normalizadas
+        route_lengths_raw = [route.length for route, _ in paths_info[:self.k_paths]]
+        if len(route_lengths_raw) > 1:
+            min_length = min(route_lengths_raw)
+            max_length = max(route_lengths_raw)
+            if max_length > min_length:
+                route_lengths_norm = np.array([(length - min_length) / (max_length - min_length) 
+                                             for length in route_lengths_raw], dtype=np.float32)
+            else:
+                route_lengths_norm = np.zeros(len(route_lengths_raw), dtype=np.float32)
+        else:
+            route_lengths_norm = np.array([0.0], dtype=np.float32)
+
+        # ========================
+        # ETAPA 4: Path/Modulation Features (NOVO)
+        # ========================
+        path_mod_features = self._compute_path_modulation_features(paths_info, path_utilizations)
+        path_mod_features_flat = path_mod_features.flatten()
+
+        # ========================
+        # ETAPA 5: Global Slot Features (Otimizada)
+        # ========================
+        available_slots_global = paths_info[0][1]
+        global_slot_features = self._compute_global_slot_features_optimized(available_slots_global)
+        global_features_flat = global_slot_features.flatten()
+
+        # ========================
+        # ETAPA 6: Path/Slot Features (Nova)
+        # ========================
+        path_slot_features = self._compute_path_slot_features_optimized(paths_info, path_utilizations)
+        path_slot_features_flat = path_slot_features.flatten()
+
+        # ========================
+        # ETAPA 7: Construir observação final
+        # ========================
         observation = np.concatenate([
-            bit_rate_obs,                         # 1 valor
-            source_destination.flatten(),         # 2 valores
-            route_lengths.flatten(),              # k_paths valores
-            spectrum_obs_flat                     # (k_paths * modulations_to_consider * 12) valores
+            basic_features,              # 1 elemento
+            route_lengths_norm,          # k_paths elementos
+            path_mod_features_flat,      # k_paths * modulations_to_consider * 2 elementos
+            global_features_flat,        # num_spectrum_resources * 4 elementos
+            path_slot_features_flat      # k_paths * num_spectrum_resources * 3 elementos
         ], axis=0).astype(np.float32)
-
+        
+        # Validação das dimensões
+        expected_size = (1 + self.k_paths + 
+                        (self.k_paths * self.modulations_to_consider * 2) + 
+                        (self.num_spectrum_resources * 4) + 
+                        (self.k_paths * self.num_spectrum_resources * 3))
+        
+        if observation.shape[0] != expected_size:
+            print(f"[ERROR] Observation size mismatch! Got {observation.shape[0]}, expected {expected_size}")
+            raise ValueError(f"Observation dimension mismatch: {observation.shape[0]} != {expected_size}")
+        
+        # Validação dos valores
+        out_of_range_count = ((observation < -1) | (observation > 1)).sum()
+        if out_of_range_count > 0:
+            print(f"[WARNING] Some observation values outside [-1,1] range!")
+            observation = np.clip(observation, -1.0, 1.0)
+        
+        # ========================
+        # LOGS ESTRUTURADOS - Formato Detalhado para Validação
+        # ========================
+        step_counter = self.episode_services_processed if hasattr(self, 'episode_services_processed') else 0
+        source_id = int(current_service.source_id)
+        destination_id = int(current_service.destination_id)
+        num_nodes = topology.number_of_nodes()
+        
+        # Cabeçalho principal
+        source_norm = source_id / (num_nodes - 1) if num_nodes > 1 else 0.0
+        destination_norm = destination_id / (num_nodes - 1) if num_nodes > 1 else 0.0
+        #print(f"\nSTEP {step_counter} | svc_id=— | bitrate={current_service.bit_rate} Gbps (norm={bit_rate_norm:.2f}) | src={source_id}/{num_nodes-1} ({source_norm:.2f}) → dst={destination_id}/{num_nodes-1} ({destination_norm:.2f})")
+        
+        # Rotas com normalização
+        route_lengths_raw = [route.length for route, _ in paths_info[:self.k_paths]]
+        min_length = min(route_lengths_raw)
+        max_length = max(route_lengths_raw)
+        routes_info = []
+        for i, (route, _) in enumerate(paths_info[:self.k_paths]):
+            route_length = route.length
+            if max_length > min_length:
+                normalized_length = (route_length - min_length) / (max_length - min_length)
+            else:
+                normalized_length = 0.0
+            routes_info.append(f"P{i}={route_length} km → {normalized_length:.2f}")
+        #print(f"Routes (norm w.r.t. [{min_length}, {max_length}] km):  {' | '.join(routes_info)}")
+        
+        # Path/Modulation Features - mostrar para primeiro slot como exemplo
+        #print(f"\nPATH/MOD FEATURES:")
+        for path_idx in range(min(len(paths_info), self.k_paths)):
+            route, available_slots = paths_info[path_idx]
+            path_length = route.length
+            utilization = path_utilizations[path_idx]
+            
+            #print(f"  P{path_idx} (length={path_length:.0f}km, util={utilization:.2f}):")
+            
+            for mod_idx in range(self.modulations_to_consider):
+                if mod_idx >= len(self.modulations):
+                    continue
+                    
+                modulation = self.modulations[mod_idx]
+                
+                # Recalcular features para debug
+                distance_penalty = min(path_length / 2000.0, 1.0)
+                max_spectral_eff = max([mod.spectral_efficiency for mod in self.modulations])
+                efficiency_bonus = modulation.spectral_efficiency / max_spectral_eff
+                utilization_penalty = utilization
+                
+                qot_quality = (efficiency_bonus * 0.5) + ((1.0 - distance_penalty) * 0.3) + ((1.0 - utilization_penalty) * 0.2)
+                
+                slots_required = self.get_number_slots(current_service, modulation)
+                available_positions = self._count_available_positions(available_slots, slots_required, f"path_{path_idx}")
+                max_possible_positions = max(1, self.num_spectrum_resources - slots_required + 1)
+                competitiveness = available_positions / max_possible_positions
+                
+                #print(f"    M{mod_idx} ({modulation.name}): qot_quality={qot_quality:.3f} (eff={efficiency_bonus:.2f}, dist_pen={distance_penalty:.2f}, util_pen={utilization_penalty:.2f}) | competitiveness={competitiveness:.3f} ({available_positions}/{max_possible_positions})")
+        
+        # PATHS detalhadas (slot 0 como exemplo)
+        #print(f"\nPATHS (slot=0):")
+        for path_idx, (route, available_slots) in enumerate(paths_info[:self.k_paths]):
+            if available_slots[0] == 1:  # Se slot 0 está disponível
+                # Calcular OSNR para slot 0
+                osnr_values = self._compute_slot_osnr_vectorized(route, available_slots)
+                osnr_db = osnr_values[0]
+                
+                # Encontrar melhor modulação
+                best_modulations = self._find_best_modulations_per_slot(available_slots, osnr_values)
+                best_mod_idx = best_modulations[0]
+                
+                if best_mod_idx >= 0:
+                    best_modulation = self.modulations[best_mod_idx]
+                    osnr_req = best_modulation.minimum_osnr + self.margin
+                    margin = osnr_db - osnr_req
+                    mod_name = best_modulation.name
+                else:
+                    osnr_req = 0.0
+                    margin = 0.0
+                    mod_name = "None"
+                    best_mod_idx = -1
+                
+                # Path quality
+                path_quality = 1.0 - min(route.length / 2000.0, 1.0)
+                
+                # Load balancing para slot 0
+                other_paths_util = np.concatenate([path_utilizations[:path_idx], path_utilizations[path_idx+1:]])
+                mean_other_utilization = np.mean(other_paths_util) if len(other_paths_util) > 0 else 0.0
+                current_path_utilization = path_utilizations[path_idx]
+                load_imbalance = mean_other_utilization - current_path_utilization
+                load_balancing_value = min(max(0.5 + load_imbalance, 0.0), 1.0)
+                
+                # Contiguous capacity para slot 0
+                contiguous_from_slot = self._count_contiguous_from_slot(0, available_slots)
+                contiguous_capacity = min(contiguous_from_slot / 50.0, 1.0)
+                
+                #print(f"  P{path_idx}: OSNR={osnr_db:.3f} dB | req={osnr_req:.2f} dB | margin={margin:+.3f} dB | best_mod={mod_name} (idx={best_mod_idx}) | path_quality={path_quality:.2f}")
+                #print(f"      load_balance={load_balancing_value:.3f} (others_avg={mean_other_utilization:.2f}, current={current_path_utilization:.2f}) | contiguous={contiguous_capacity:.3f} ({contiguous_from_slot} slots)")
+            #else:
+                #print(f"  P{path_idx}: slot 0 unavailable")
+        
+        # SLOTS globais
+        #print(f"\nSLOTS (0..{self.num_spectrum_resources-1}) [is_avail, block_norm, frag, edge_norm]")
+        available_slots_global = paths_info[0][1]
+        fragmentation_global = self._get_cached_fragmentation(available_slots_global, "global_optimized")
+        
+        # Mostrar apenas primeiros 5 slots para não poluir
+        for slot in range(min(5, self.num_spectrum_resources)):
+            if available_slots_global[slot] == 1:
+                # Recalcular features para debug
+                local_block_size = self._get_local_block_size(slot, available_slots_global)
+                block_norm = min(local_block_size / 50.0, 1.0)
+                frag = fragmentation_global[slot]
+                edge_distance = min(slot, self.num_spectrum_resources - 1 - slot) / (self.num_spectrum_resources / 2.0)
+                
+                #print(f"  s{slot}: [1, {block_norm:.2f}, {frag:.2f}, {edge_distance:.2f}] | block_size={local_block_size}, edge_dist={min(slot, self.num_spectrum_resources - 1 - slot)}")
+            #else:
+                #print(f"  s{slot}: [0, -1.00, -1.00, -1.00] (unavailable)")
+        
+        #if self.num_spectrum_resources > 5:
+            #print(f"  ... (showing first 5 of {self.num_spectrum_resources} slots)")
+        
+        # Estatísticas da observation
+        #print(f"\nOBS (sanity): shape={observation.shape[0]} | min={observation.min():.2f} | max={observation.max():.2f} | out_of_range={out_of_range_count}")
+        #print(f"Structure breakdown: basic={len(basic_features)} + routes={len(route_lengths_norm)} + path/mod={path_mod_features_flat.shape[0]} + global={global_features_flat.shape[0]} + path/slot={path_slot_features_flat.shape[0]}")
+        
+        # Simulação de decisão
+        if valid_actions > 0:
+            first_valid_action = np.where(action_mask[:-1] == 1)[0][0]
+            p_idx = first_valid_action // (self.modulations_to_consider * self.num_spectrum_resources)
+            mod_and_slot = first_valid_action % (self.modulations_to_consider * self.num_spectrum_resources)
+            m_idx = mod_and_slot // self.num_spectrum_resources
+            s_idx = mod_and_slot % self.num_spectrum_resources
+            
+            if p_idx < len(path_modulations_cache) and m_idx < len(path_modulations_cache[p_idx]):
+                selected_mod = path_modulations_cache[p_idx][m_idx]
+                #print(f"DECISÃO: path={p_idx} | slot={s_idx} | mod={selected_mod.name} | ok=True")
+            #else:
+                #print(f"DECISÃO: path={p_idx} | slot={s_idx} | mod=unknown | ok=True")
+        #else:
+            #print(f"DECISÃO: reject | reason=no_valid_actions")
+        
         return observation, {'mask': action_mask}
+
+    def observation_slot_wise(self):
+        """Nova função observation com estrutura otimizada - 185 elementos sem redundância"""
+        if not self.gen_observation:
+            obs = np.zeros((self.observation_space.shape[0],), dtype=np.float32)
+            action_mask = np.zeros((self.action_space.n,), dtype=np.uint8)
+            return obs, {'mask': action_mask}
+        
+        # Preparação inicial
+        topology = self.topology
+        current_service = self.current_service
+        num_spectrum_resources = self.num_spectrum_resources
+        k_shortest_paths = self.k_shortest_paths
+        num_nodes = topology.number_of_nodes()
+        max_bit_rate = max(self.bit_rates)
+        self.get_max_modulation_index()
+
+        # ========================
+        # ETAPA 1: Gerar ACTION MASK primeiro
+        # ========================
+        
+        # Preparar informações dos caminhos
+        paths_info = []
+        source = current_service.source
+        destination = current_service.destination
+        
+        for path_index, route in enumerate(k_shortest_paths[source, destination]):
+            if path_index >= self.k_paths:
+                break
+            available_slots = self._get_cached_available_slots(route, f"path_{path_index}")
+            paths_info.append((route, available_slots))
+
+        # Gerar action mask usando informações dos slots calculados
+        total_actions = self.k_paths * self.modulations_to_consider * num_spectrum_resources
+        action_mask = np.zeros(total_actions + 1, dtype=np.uint8)
+        
+        valid_actions = 0
+        # Cache para modulações por caminho
+        path_modulations_cache = {}
+        path_window_masks = {}
+        
+        for action_index in range(total_actions):
+            p_idx = action_index // (self.modulations_to_consider * num_spectrum_resources)
+            mod_and_slot = action_index % (self.modulations_to_consider * num_spectrum_resources)
+            m_idx = mod_and_slot // num_spectrum_resources
+            init_slot = mod_and_slot % num_spectrum_resources
+            
+            if p_idx >= len(paths_info):
+                continue
+                
+            route, available_slots = paths_info[p_idx]
+            cache_prefix = f"path_{p_idx}"
+            
+            # Verificar se slot está disponível
+            if available_slots[init_slot] == 0:
+                continue
+                
+            # Cache das modulações para este caminho
+            if p_idx not in path_modulations_cache:
+                start_index = max(0, self.max_modulation_idx - (self.modulations_to_consider - 1))
+                path_modulations_cache[p_idx] = list(reversed(self.modulations[start_index: self.max_modulation_idx + 1][:self.modulations_to_consider]))
+            modulation_list = path_modulations_cache[p_idx]
+            if m_idx >= len(modulation_list):
+                continue
+            modulation = modulation_list[m_idx]
+            num_slots_required = self.get_number_slots(self.current_service, modulation)
+            
+            # Verificar se há slots suficientes a partir desta posição
+            if init_slot + num_slots_required > num_spectrum_resources:
+                continue
+            
+            base_key = (p_idx, num_slots_required)
+            if base_key not in path_window_masks:
+                path_window_masks[base_key] = self._get_cached_window_mask(available_slots, cache_prefix, num_slots_required)
+            base_mask = path_window_masks[base_key]
+            if init_slot >= base_mask.shape[0] or base_mask[init_slot] == 0:
+                continue
+                
+            # Verificar se path está livre usando verificação rigorosa
+            if not self.is_path_free(route, init_slot, num_slots_required):
+                continue
+            
+            # Verificar QoT constraint
+            self.current_service.path = route
+            self.current_service.initial_slot = init_slot
+            self.current_service.number_slots = num_slots_required
+            self.current_service.center_frequency = (
+                self.frequency_start +
+                self.frequency_slot_bandwidth * (init_slot + num_slots_required / 2)
+            )
+            self.current_service.bandwidth = self.frequency_slot_bandwidth * num_slots_required
+            self.current_service.launch_power = self.launch_power
+            self.current_service.blocked_due_to_resources = False
+
+            if self.qot_constraint == "DIST":
+                qot_acceptable = route.length <= modulation.maximum_length
+            else:
+                osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
+            
+            # Limpar configuração temporária
+            self.current_service.path = None
+            self.current_service.initial_slot = -1
+            self.current_service.number_slots = 0
+            self.current_service.center_frequency = 0.0
+            self.current_service.bandwidth = 0.0
+            self.current_service.launch_power = 0.0
+            
+            if qot_acceptable:
+                    action_mask[action_index] = 1
+                    valid_actions += 1
+        
+        action_mask[-1] = 1  # Reject action sempre válida
+
+        # ========================
+        # ETAPA 2: Computar features básicas
+        # ========================
+        
+        # Features básicas (3 valores)
+        source_id = int(current_service.source_id)
+        destination_id = int(current_service.destination_id)
+        
+        bit_rate_norm = current_service.bit_rate / max_bit_rate
+        source_norm = source_id / (num_nodes - 1) if num_nodes > 1 else 0.0
+        destination_norm = destination_id / (num_nodes - 1) if num_nodes > 1 else 0.0
+        
+        # ========================
+        # LOGS ESTRUTURADOS - Formato Solicitado
+        # ========================
+        
+        # Cabeçalho principal com step counter
+        step_counter = self.episode_services_processed if hasattr(self, 'episode_services_processed') else 0
+        #print(f"\nSTEP {step_counter} | bitrate={current_service.bit_rate} Gbps (norm={bit_rate_norm:.2f}) | src={source_id}/{num_nodes-1} ({source_norm:.2f}) → dst={destination_id}/{num_nodes-1} ({destination_norm:.2f})")
+        
+        # Informações das modulações para referência
+        #print(f"Modulations: [{', '.join([f'{mod.name}@{mod.minimum_osnr:.1f}dB' for mod in self.modulations])}] | margin={self.margin:.1f}dB")
+        
+        basic_features = np.array([bit_rate_norm, source_norm, destination_norm], dtype=np.float32)
+
+        # Route lengths (k_paths valores) - CORREÇÃO: usar path lengths reais
+        route_lengths_raw = [route.length for route, _ in paths_info[:self.k_paths]]
+        min_length = min(route_lengths_raw)
+        max_length = max(route_lengths_raw)
+        
+        # Log das rotas em uma linha
+        routes_info = []
+        route_lengths = np.zeros(self.k_paths, dtype=np.float32)
+        for i, (route, _) in enumerate(paths_info):
+            if i < self.k_paths:
+                route_length = route.length
+                normalized_length = self.normalize_value(route_length, min_length, max_length)
+                route_lengths[i] = normalized_length
+                routes_info.append(f"P{i}={route_length:.0f} km → {normalized_length:.2f}")
+        
+        #print(f"Routes (norm w.r.t. [{min_length:.0f}, {max_length:.0f}] km):  {' | '.join(routes_info)}")
+
+        # ========================
+        # ETAPA 3: Features globais dos slots (UMA VEZ SÓ)
+        # ========================
+        
+        # Usar primeiro path para features globais (são iguais para todos)
+        available_slots_global = paths_info[0][1]
+        fragmentation_global = self._get_cached_fragmentation(available_slots_global, "global")
+        global_slot_features = self._compute_global_slot_features(available_slots_global, fragmentation_global)
+
+        # ========================
+        # ETAPA 4: Features path-específicas para cada caminho
+        # ========================
+        
+        path_specific_features = []
+        
+        # Armazenar dados para logs estruturados
+        paths_log_data = []
+        
+        for path_idx, (route, available_slots) in enumerate(paths_info):
+            if path_idx >= self.k_paths:
+                break
+            
+            # Calcular features path-específicas  
+            osnr_values = self._compute_slot_osnr_vectorized(route, available_slots)
+            best_modulations = self._find_best_modulations_per_slot(available_slots, osnr_values)
+            
+            path_features = self._compute_path_specific_features(route, available_slots, osnr_values, best_modulations)
+            path_specific_features.append(path_features.flatten())
+            
+            # Guardar dados para logs (apenas slot 0 para exemplo)
+            if available_slots[0] == 1:  # Se slot 0 está disponível
+                osnr_db = osnr_values[0]
+                best_mod_idx = best_modulations[0]
+                
+                if best_mod_idx >= 0:
+                    best_modulation = self.modulations[best_mod_idx]
+                    osnr_req = best_modulation.minimum_osnr
+                    margin = osnr_db - osnr_req
+                    mod_name = best_modulation.name
+                    
+                    # Path quality baseado na distância
+                    path_quality = 1.0 - min(route.length / 2000.0, 1.0)
+                else:
+                    osnr_req = 0.0
+                    margin = 0.0
+                    mod_name = "None"
+                    path_quality = 0.0
+                
+                paths_log_data.append({
+                    'path_idx': path_idx,
+                    'osnr_db': osnr_db,
+                    'osnr_req': osnr_req,
+                    'margin': margin,
+                    'mod_name': mod_name,
+                    'mod_idx': best_mod_idx,
+                    'path_quality': path_quality
+                })
+            else:
+                paths_log_data.append({
+                    'path_idx': path_idx,
+                    'osnr_db': -1,
+                    'osnr_req': -1,
+                    'margin': -1,
+                    'mod_name': "N/A",
+                    'mod_idx': -1,
+                    'path_quality': 0.0
+                })
+        
+        # LOG ESTRUTURADO DOS PATHS (slot=0)
+        #print(f"\nPATHS (slot=0) + path_features_info")
+        for path_data in paths_log_data:
+            if path_data['osnr_db'] >= 0:
+                # Calcular informações extras para features path-específicas
+                path_idx = path_data['path_idx']
+                route = paths_info[path_idx][0]
+                available_slots = paths_info[path_idx][1]
+                osnr_values = self._compute_slot_osnr_vectorized(route, available_slots)
+                best_modulations = self._find_best_modulations_per_slot(available_slots, osnr_values)
+                
+                # Dados para normalização OSNR (por path)
+                valid_osnr = osnr_values[osnr_values >= 0]
+                osnr_min = np.min(valid_osnr) if len(valid_osnr) > 0 else 0.0
+                osnr_max = np.max(valid_osnr) if len(valid_osnr) > 0 else 1.0
+                osnr_range = osnr_max - osnr_min if osnr_max > osnr_min else 1.0
+                
+                # Eficiência espectral máxima disponível
+                max_se = max([mod.spectral_efficiency for mod in self.modulations])
+                best_mod_se = self.modulations[path_data['mod_idx']].spectral_efficiency if path_data['mod_idx'] >= 0 else 0.0
+                
+                #print(f"  P{path_data['path_idx']}: OSNR={path_data['osnr_db']:.3f} dB | req={path_data['osnr_req']:.2f} dB | margin={path_data['margin']:+.3f} dB | best_mod={path_data['mod_name']} (idx={path_data['mod_idx']}) | path_quality={path_data['path_quality']:.2f}")
+                #print(f"    ↳ feat_calc: osnr_range=[{osnr_min:.1f}, {osnr_max:.1f}], se={best_mod_se:.1f}/{max_se:.1f}, length={route.length:.0f}km, margin_norm={path_data['margin']/10.0:.3f}")
+            #else:
+                #print(f"  P{path_data['path_idx']}: slot unavailable")
+        
+        # LOG ESTRUTURADO DOS SLOTS GLOBAIS
+        #print(f"\nSLOTS (0..{num_spectrum_resources-1})  [is_avail, block_norm, frag, edge_norm, ctx] + calc_info")
+        for slot in range(num_spectrum_resources):
+            features = global_slot_features[slot]
+            if available_slots_global[slot] == 1:
+                # Calcular informações extras para validação
+                local_block_size = self._get_local_block_size(slot, available_slots_global)
+                edge_distance_raw = min(slot, num_spectrum_resources - 1 - slot)
+                context_start = max(0, slot - 8)
+                context_end = min(num_spectrum_resources, slot + 8 + 1)
+                context_util_raw = 1.0 - np.mean(available_slots_global[context_start:context_end])
+                
+                #print(f"  s{slot}: [{features[0]:.0f}, {features[1]:.2f}, {features[2]:.2f}, {features[3]:.2f}, {features[4]:.2f}] | block_sz={local_block_size}, edge_dist={edge_distance_raw}, ctx_window=[{context_start}:{context_end}], ctx_util={context_util_raw:.3f}")
+            #else:
+                #print(f"  s{slot}: [0, -, -, -, -] (unavailable)")
+
+        # ========================
+        # ETAPA 5: Construir observação final otimizada
+        # ========================
+        
+        # Flatten global features: (num_slots, 5) -> (num_slots * 5,)
+        global_features_flat = global_slot_features.flatten()
+        
+        # Concatenar todas as features na nova estrutura
+        observation = np.concatenate([
+            basic_features,        # 3 valores
+            route_lengths,         # k_paths valores  
+            global_features_flat,  # num_slots * 5 valores (features globais)
+            *path_specific_features # k_paths * (num_slots * 6) valores (features path-específicas)
+        ], axis=0).astype(np.float32)
+        
+        # Validação das dimensões
+        expected_size = 3 + self.k_paths + (self.num_spectrum_resources * 5) + (self.k_paths * self.num_spectrum_resources * 6)
+        if observation.shape[0] != expected_size:
+            #print(f"[ERROR] Observation size mismatch! Got {observation.shape[0]}, expected {expected_size}")
+            raise ValueError(f"Observation dimension mismatch: {observation.shape[0]} != {expected_size}")
+        
+        # Validação dos valores (devem estar entre -1 e 1)
+        out_of_range_count = ((observation < -1) | (observation > 1)).sum()
+        if out_of_range_count > 0:
+            #print(f"[WARNING] Some observation values outside [-1,1] range!")
+            #print(f"          Min: {np.min(observation):.6f}, Max: {np.max(observation):.6f}")
+            # Clip para garantir que está no range
+            observation = np.clip(observation, -1.0, 1.0)
+        
+        # RESUMO FINAL DA OBSERVAÇÃO
+        #print(f"\nOBS (sanity): shape={observation.shape[0]} | min={observation.min():.2f} | max={observation.max():.2f} | out_of_range={out_of_range_count}")
+        
+        # Simulação de decisão (para exemplo nos logs)
+        valid_actions_count = np.sum(action_mask[:-1])  # Excluir reject action
+        if valid_actions_count > 0:
+            # Encontrar primeira ação válida para exemplo
+            first_valid_action = np.where(action_mask[:-1] == 1)[0][0]
+            p_idx = first_valid_action // (self.modulations_to_consider * num_spectrum_resources)
+            mod_and_slot = first_valid_action % (self.modulations_to_consider * num_spectrum_resources)
+            m_idx = mod_and_slot // num_spectrum_resources
+            slot_idx = mod_and_slot % num_spectrum_resources
+            
+            # Obter nome da modulação
+            start_index = max(0, self.max_modulation_idx - (self.modulations_to_consider - 1))
+            path_modulations = list(reversed(self.modulations[start_index: self.max_modulation_idx + 1][:self.modulations_to_consider]))
+            mod_name = path_modulations[m_idx].name if m_idx < len(path_modulations) else "Unknown"
+            
+            #print(f"DECISÃO (exemplo): path={p_idx} | slot={slot_idx} | mod={mod_name} | valid_actions={valid_actions_count} | ok=True")
+        #else:
+            #print(f"DECISÃO (exemplo): REJECT | valid_actions=0 | ok=False")
+        
+        #print(f"{'='*80}")
+        
+        return observation, {'mask': action_mask}
+
+    def observation(self):
+        # NOVA IMPLEMENTAÇÃO OTIMIZADA
+        return self.observation_optimized()
 
 
 
@@ -956,28 +1434,36 @@ cdef class QRMSAEnv:
 
                     self._add_release(self.current_service)
                 else:
-                    if self.qot_constraint == "DIST":
-                        raise ValueError(
-                            f"Path distance {path_distance:.2f} km is greater than maximum length "
-                            f"{modulation.maximum_length} km for service {self.current_service.service_id} "
-                            f"with modulation {modulation}."
-                        )
-                    else:
-                        raise ValueError(
-                            f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
-                            f"with modulation {modulation}, and osnr_req {osnr_req}."
-                        )
+                    # QoT não aceitável - serviço bloqueado por OSNR/distância
                     self.current_service.accepted = False
                     self.current_service.blocked_due_to_osnr = True
                     self.bl_osnr += 1
+                    
+                    # Se não está em modo RL, lança exceção (comportamento original)
+                    if not self.rl_mode:
+                        if self.qot_constraint == "DIST":
+                            raise ValueError(
+                                f"Path distance {path_distance:.2f} km is greater than maximum length "
+                                f"{modulation.maximum_length} km for service {self.current_service.service_id} "
+                                f"with modulation {modulation}."
+                            )
+                        else:
+                            raise ValueError(
+                                f"Osnr {osnr} is not enough for service {self.current_service.service_id} "
+                                f"with modulation {modulation}, and osnr_req {osnr_req}."
+                            )
             else:
-                raise ValueError(
-                    f"Path {path} is not free for service {self.current_service.service_id} "
-                    f"with initial slot {initial_slot} and number of slots {number_slots}."
-                )
+                # Caminho não está livre - serviço bloqueado por recursos
                 self.current_service.accepted = False
                 self.current_service.blocked_due_to_resources = True
                 self.bl_resource += 1
+                
+                # Se não está em modo RL, lança exceção (comportamento original)
+                if not self.rl_mode:
+                    raise ValueError(
+                        f"Path {path} is not free for service {self.current_service.service_id} "
+                        f"with initial slot {initial_slot} and number of slots {number_slots}."
+                    )
 
         if self.measure_disruptions and self.current_service.accepted:
             services_to_measure = []
@@ -1045,10 +1531,7 @@ cdef class QRMSAEnv:
             self.file_stats.write(line)
             self.file_stats.flush()
 
-        if not action == (self.action_space.n - 1):
-            reward = self.reward()
-        else:
-            reward = -3.0
+        # Inicializar info dict (será preenchido antes de calcular reward)
         info = {
             "episode_services_accepted": self.episode_services_accepted,
             "service_blocking_rate": 0.0,
@@ -1065,7 +1548,7 @@ cdef class QRMSAEnv:
             "episode_service_realocations": self.episode_service_realocations,
         }
         # Verificar se isso vai se manter após o paper
-        # Calculate current fragmentation metrics
+        # Calculate current fragmentation metrics (ANTES da reward!)
         if len(self.topology.graph["running_services"]) > 0:
             # Get available slots for all links
             available_slots_matrix = []
@@ -1097,6 +1580,9 @@ cdef class QRMSAEnv:
             info["fragmentation_shannon_entropy"] = 0.0
             info["fragmentation_route_cuts"] = 0
             info["fragmentation_route_rss"] = 0.0
+
+        # Calcular reward APÓS ter métricas de fragmentação no info dict
+        reward = self.reward(info)
 
         if self.services_processed > 0:
             info["service_blocking_rate"] = float(
@@ -1147,6 +1633,14 @@ cdef class QRMSAEnv:
             info["blocked_due_to_resources"] = self.bl_resource
             info["blocked_due_to_osnr"] = self.bl_osnr
             info["rejected"] = self.bl_reject
+
+        # Clear caches before generating new observation since state has changed
+        self.available_slots_cache.clear()
+        self.available_slots_signature_cache.clear()
+        self.block_info_cache.clear()
+        self.osnr_matrix_cache.clear()
+        self.fragmentation_cache.clear()
+        self.slot_window_cache.clear()
 
         observation, mask = self.observation()
         info.update(mask)
@@ -1290,6 +1784,563 @@ cdef class QRMSAEnv:
         self.modulation_slots_cache[cache_key] = result
         return result
 
+    # Funções auxiliares para observações slot-wise eficientes
+    
+    cdef cnp.ndarray _get_cached_available_slots(self, object path, str cache_key):
+        """Obtém available_slots do cache ou calcula se necessário"""
+        if cache_key not in self.available_slots_cache:
+            self.available_slots_cache[cache_key] = self.get_available_slots(path)
+        return self.available_slots_cache[cache_key]
+    
+    cdef dict _get_cached_block_info(self, cnp.ndarray available_slots, str cache_key):
+        """Obtém informações de blocos do cache ou calcula se necessário"""
+        if cache_key not in self.block_info_cache:
+            initial_indices, values, lengths = rle(available_slots)
+            free_blocks = []
+            for start, val, length in zip(initial_indices, values, lengths):
+                if val == 1:
+                    free_blocks.append((start, length))
+            self.block_info_cache[cache_key] = {
+                'free_blocks': free_blocks,
+                'total_free_slots': np.sum(available_slots),
+                'num_free_blocks': len(free_blocks)
+            }
+        return self.block_info_cache[cache_key]
+    
+    cdef cnp.ndarray _get_cached_fragmentation(self, cnp.ndarray available_slots, str cache_key):
+        """Calcula fragmentação local para cada slot (janela ±16)"""
+        cdef int num_slots = self.num_spectrum_resources
+        cdef cnp.ndarray fragmentation
+        cdef int window_size = 16
+        cdef int i, start, end, free_in_window, window_length
+        
+        if cache_key not in self.fragmentation_cache:
+            fragmentation = np.zeros(num_slots, dtype=np.float32)
+            
+            for i in range(num_slots):
+                start = max(0, i - window_size)
+                end = min(num_slots, i + window_size + 1)
+                window_length = end - start
+                free_in_window = np.sum(available_slots[start:end])
+                
+                # Fragmentação = 1 - (slots_livres / tamanho_janela)
+                fragmentation[i] = 1.0 - (free_in_window / window_length)
+                
+            self.fragmentation_cache[cache_key] = fragmentation
+        return self.fragmentation_cache[cache_key]
+
+    cdef cnp.ndarray _get_cached_window_mask(self, cnp.ndarray available_slots, str cache_key, int window_size):
+        """Retorna máscara booleana (via convolução) indicando janelas contínuas de slots livres."""
+        cdef str window_key
+        cdef Py_ssize_t total_slots = available_slots.shape[0]
+        if window_size <= 0:
+            return np.zeros((0,), dtype=np.uint8)
+        if window_size > total_slots:
+            return np.zeros((0,), dtype=np.uint8)
+        window_key = f"{cache_key}_win_{window_size}"
+        if window_key not in self.slot_window_cache:
+            slot_view = np.asarray(available_slots, dtype=np.int8)
+            kernel = np.ones(window_size, dtype=np.int8)
+            window_sums = np.convolve(slot_view, kernel, mode="valid")
+            self.slot_window_cache[window_key] = (window_sums == window_size).astype(np.uint8)
+        return self.slot_window_cache[window_key]
+
+    cdef cnp.ndarray _compute_slot_osnr_vectorized(self, object path, cnp.ndarray available_slots):
+        """Calcula OSNR para todos os slots de uma vez usando vetorização"""
+        cdef str cache_key = f"osnr_{path.k}_{hash(tuple(available_slots))}"
+        
+        if cache_key not in self.osnr_matrix_cache:
+            # Usar função do core/osnr.pyx com qot_constraint flexível
+            self.osnr_matrix_cache[cache_key] = compute_slot_osnr_vectorized(self, path, available_slots, self.qot_constraint)
+            
+            # Validar se solicitado (apenas no debug)
+            if hasattr(self, 'validate_osnr') and self.validate_osnr:
+                validation_passed = validate_osnr_vectorized(self, path, available_slots, 1e-6, self.qot_constraint)
+                if not validation_passed:
+                    print(f"[WARNING] OSNR vectorized validation failed for path {path.k}")
+            
+        return self.osnr_matrix_cache[cache_key]
+
+    cdef dict _get_free_blocks_info(self, cnp.ndarray available_slots):
+        """Extrai informações detalhadas sobre blocos livres"""
+        cdef str cache_key = f"blocks_{hash(tuple(available_slots))}"
+        
+        if cache_key not in self.block_info_cache:
+            initial_indices, values, lengths = rle(available_slots)
+            free_blocks = []
+            total_free_slots = 0
+            
+            for start, val, length in zip(initial_indices, values, lengths):
+                if val == 1:  # Bloco livre
+                    free_blocks.append({
+                        'start': start,
+                        'length': length,
+                        'end': start + length - 1
+                    })
+                    total_free_slots += length
+            
+            block_info = {
+                'free_blocks': free_blocks,
+                'total_free_slots': total_free_slots,
+                'num_free_blocks': len(free_blocks),
+                'largest_block': max([b['length'] for b in free_blocks]) if free_blocks else 0,
+                'avg_block_size': total_free_slots / len(free_blocks) if free_blocks else 0.0
+            }
+            
+            self.block_info_cache[cache_key] = block_info
+
+            
+        return self.block_info_cache[cache_key]
+
+    cdef list _find_best_modulations_per_slot(self, cnp.ndarray available_slots, cnp.ndarray osnr_values):
+        """Determina a melhor modulação viável para cada slot"""
+        cdef int num_slots = self.num_spectrum_resources
+        cdef list best_modulations = []
+        cdef int slot, best_mod_idx
+        cdef double slot_osnr
+        cdef object modulation
+        
+        for slot in range(num_slots):
+            best_mod_idx = -1
+            
+            if available_slots[slot] == 1:  # Slot disponível
+                slot_osnr = osnr_values[slot]
+                
+                # Procurar a melhor modulação (maior eficiência espectral) que satisfaz OSNR
+                for mod_idx in range(len(self.modulations) - 1, -1, -1):  # Do maior para menor SE
+                    modulation = self.modulations[mod_idx]
+                    if slot_osnr >= modulation.minimum_osnr + self.margin:
+                        best_mod_idx = mod_idx
+                        break
+                        
+            best_modulations.append(best_mod_idx)
+        
+        return best_modulations
+
+    cdef cnp.ndarray _compute_slot_features(self, object path, cnp.ndarray available_slots, 
+                                           cnp.ndarray osnr_values, list best_modulations,
+                                           dict block_info, cnp.ndarray fragmentation):
+        """Gera as 10 features por slot usando as funções auxiliares"""
+        cdef int num_slots = self.num_spectrum_resources
+        cdef cnp.ndarray features = np.zeros((num_slots, 10), dtype=np.float32)
+        cdef int slot, best_mod_idx, local_block_size
+        cdef double edge_distance, osnr_normalized, osnr_margin, spectral_efficiency
+        cdef object best_modulation
+        
+
+        
+        # Normalização global para OSNR (calculada uma vez)
+        cdef double osnr_min = np.min(osnr_values[osnr_values >= 0]) if np.any(osnr_values >= 0) else 0.0
+        cdef double osnr_max = np.max(osnr_values)
+        cdef double osnr_range = osnr_max - osnr_min if osnr_max > osnr_min else 1.0
+        
+
+        
+        for slot in range(num_slots):
+            # Feature 1: is_available (0.0 ou 1.0)
+            features[slot, 0] = float(available_slots[slot])
+            
+            # Feature 2: local_block_size (tamanho do bloco que contém este slot)
+            local_block_size = self._get_local_block_size(slot, available_slots)
+            features[slot, 1] = min(local_block_size / 50.0, 1.0)  # Normalizar por 50 slots max
+            
+            # Feature 3: fragmentation_local (já calculada)
+            features[slot, 2] = fragmentation[slot]
+            
+            # Feature 4: edge_proximity (distância das bordas, normalizada)
+            edge_distance = min(slot, num_slots - 1 - slot) / (num_slots / 2.0)
+            features[slot, 3] = edge_distance
+            
+            # Feature 5: osnr_normalized
+            if available_slots[slot] == 1 and osnr_values[slot] >= 0:
+                features[slot, 4] = (osnr_values[slot] - osnr_min) / osnr_range
+            else:
+                features[slot, 4] = 0.0
+            
+            # Feature 6: osnr_margin_best_mod
+            best_mod_idx = best_modulations[slot]
+            if best_mod_idx >= 0 and available_slots[slot] == 1:
+                best_modulation = self.modulations[best_mod_idx]
+                osnr_margin = osnr_values[slot] - best_modulation.minimum_osnr
+                features[slot, 5] = min(osnr_margin / 10.0, 1.0)  # Normalizar por 10dB margem max
+            else:
+                features[slot, 5] = 0.0
+            
+            # Feature 7: path_quality_indicator (baseado no path length normalizado)
+            path_quality = 1.0 - min(path.length / 2000.0, 1.0)  # Assumindo 2000km como max
+            features[slot, 6] = path_quality
+            
+            # Feature 8: best_modulation_tier (tier da melhor modulação)
+            if best_mod_idx >= 0:
+                features[slot, 7] = best_mod_idx / (len(self.modulations) - 1)
+            else:
+                features[slot, 7] = 0.0
+            
+            # Feature 9: spectral_efficiency_potential
+            if best_mod_idx >= 0:
+                best_modulation = self.modulations[best_mod_idx]
+                spectral_efficiency = best_modulation.spectral_efficiency
+                # Normalizar pela máxima eficiência espectral disponível
+                max_se = max([mod.spectral_efficiency for mod in self.modulations])
+                features[slot, 8] = spectral_efficiency / max_se
+            else:
+                features[slot, 8] = 0.0
+            
+            # Feature 10: utilization_context (utilização na vizinhança ±8 slots)
+            context_start = max(0, slot - 8)
+            context_end = min(num_slots, slot + 8 + 1)
+            context_utilization = 1.0 - np.mean(available_slots[context_start:context_end])
+            features[slot, 9] = context_utilization
+        
+
+
+
+        
+        return features
+
+    cdef cnp.ndarray _compute_global_slot_features(self, cnp.ndarray available_slots, cnp.ndarray fragmentation):
+        """Calcula features globais dos slots (independem do path) - 5 features por slot"""
+        cdef int num_slots = self.num_spectrum_resources
+        cdef cnp.ndarray features = np.zeros((num_slots, 5), dtype=np.float32)
+        cdef int slot, local_block_size, context_start, context_end
+        cdef double edge_distance, context_utilization
+        
+        # DEBUG LIMPO: Só mostrar features globais resumidas (comentado para logs estruturados)
+        # print(f"\n🔍 DEBUG FEATURES GLOBAIS (5 features × {num_slots} slots):")
+        
+        for slot in range(num_slots):
+            if available_slots[slot] == 1:  # Slot disponível
+                # Feature 0: is_available  
+                features[slot, 0] = 1.0
+                
+                # Feature 1: local_block_size
+                local_block_size = self._get_local_block_size(slot, available_slots)
+                features[slot, 1] = min(local_block_size / 50.0, 1.0)
+                
+                # Feature 2: fragmentation_local
+                features[slot, 2] = fragmentation[slot]
+                
+                # Feature 3: edge_proximity  
+                edge_distance = min(slot, num_slots - 1 - slot) / (num_slots / 2.0)
+                features[slot, 3] = edge_distance
+                
+                # Feature 4: utilization_context
+                context_start = max(0, slot - 8)
+                context_end = min(num_slots, slot + 8 + 1)
+                context_utilization = 1.0 - np.mean(available_slots[context_start:context_end])
+                # Garantir que está em [0,1]
+                context_utilization = min(max(context_utilization, 0.0), 1.0)
+                features[slot, 4] = context_utilization
+                
+                # DEBUG comentado para logs estruturados
+                # if slot == 0:
+                #     print(f"  Slot {slot} (disponível):")
+                #     print(f"    is_available: 1.0")
+                #     print(f"    local_block_size: {local_block_size} → norm: {features[slot, 1]:.6f}")
+                #     print(f"    fragmentation: {fragmentation[slot]:.6f}")
+                #     print(f"    edge_distance: min({slot}, {num_slots-1-slot}) / {num_slots/2.0} → {edge_distance:.6f}")
+                #     print(f"    context_util: window[{context_start}:{context_end}] → {context_utilization:.6f}")
+                
+            else:  # Slot indisponível
+                # Todas as features = -1 para slots indisponíveis
+                features[slot, 0] = -1.0
+                features[slot, 1] = -1.0
+                features[slot, 2] = -1.0
+                features[slot, 3] = -1.0
+                features[slot, 4] = -1.0
+        
+        return features
+
+    cdef cnp.ndarray _compute_path_specific_features(self, object path, cnp.ndarray available_slots, 
+                                                   cnp.ndarray osnr_values, list best_modulations):
+        """Calcula features específicas do path - 6 features por slot"""
+        cdef int num_slots = self.num_spectrum_resources
+        cdef cnp.ndarray features = np.zeros((num_slots, 6), dtype=np.float32)
+        cdef int slot, best_mod_idx, required_mod_idx
+        cdef double osnr_min, osnr_max, osnr_range, path_quality, osnr_margin
+        cdef double spectral_efficiency, max_se, modulation_efficiency_ratio
+        cdef object best_modulation, required_modulation
+        
+        # DEBUG LIMPO: path-specific resumidas (comentado para logs estruturados)
+        # print(f"\n🔍 DEBUG FEATURES PATH-ESPECÍFICAS - Path {path.k}:")
+        
+        # OSNR normalização POR PATH
+        valid_osnr = osnr_values[osnr_values >= 0]
+        if len(valid_osnr) > 0:
+            osnr_min = np.min(valid_osnr)
+            osnr_max = np.max(valid_osnr)
+            osnr_range = osnr_max - osnr_min if osnr_max > osnr_min else 1.0
+        else:
+            osnr_min = 0.0
+            osnr_max = 1.0
+            osnr_range = 1.0
+        
+        # print(f"  OSNR range: min={osnr_min:.3f}, max={osnr_max:.3f}, range={osnr_range:.3f}")
+        
+        # Path quality POR PATH
+        path_quality = 1.0 - min(path.length / 2000.0, 1.0)
+        # print(f"  Path quality: length={path.length:.1f} → quality={path_quality:.6f}")
+        
+        # Encontrar modulação mínima necessária para o serviço atual
+        required_mod_idx = 0
+        for mod_idx, modulation in enumerate(self.modulations):
+            if self.get_number_slots(self.current_service, modulation) <= self.num_spectrum_resources:
+                required_mod_idx = mod_idx
+                break
+        # print(f"  Required modulation idx: {required_mod_idx}")
+        
+        for slot in range(num_slots):
+            if available_slots[slot] == 1:  # Slot disponível
+                # Feature 0: osnr_normalized (POR PATH)
+                if osnr_values[slot] >= 0:
+                    features[slot, 0] = (osnr_values[slot] - osnr_min) / osnr_range
+                else:
+                    features[slot, 0] = 0.0
+                
+                # Feature 1: osnr_margin_best_mod (POR PATH)
+                best_mod_idx = best_modulations[slot]
+                if best_mod_idx >= 0:
+                    best_modulation = self.modulations[best_mod_idx]
+                    osnr_margin = osnr_values[slot] - best_modulation.minimum_osnr
+                    features[slot, 1] = min(osnr_margin / 10.0, 1.0)
+                else:
+                    features[slot, 1] = 0.0
+                
+                # Feature 2: path_quality (POR PATH)
+                features[slot, 2] = path_quality
+                
+                # Feature 3: best_modulation_tier (POR PATH)
+                if best_mod_idx >= 0:
+                    features[slot, 3] = best_mod_idx / (len(self.modulations) - 1)
+                else:
+                    features[slot, 3] = 0.0
+                
+                # Feature 4: spectral_efficiency_potential (POR PATH)
+                if best_mod_idx >= 0:
+                    best_modulation = self.modulations[best_mod_idx]
+                    spectral_efficiency = best_modulation.spectral_efficiency
+                    max_se = max([mod.spectral_efficiency for mod in self.modulations])
+                    features[slot, 4] = spectral_efficiency / max_se
+                else:
+                    features[slot, 4] = 0.0
+                
+                # Feature 5: modulation_efficiency_ratio (NOVA - POR PATH)
+                if best_mod_idx >= 0 and required_mod_idx < len(self.modulations):
+                    required_modulation = self.modulations[required_mod_idx]
+                    best_modulation = self.modulations[best_mod_idx]
+                    modulation_efficiency_ratio = best_modulation.spectral_efficiency / required_modulation.spectral_efficiency
+                    # Normalizar adequadamente: ratio geralmente está entre 1.0 e 4.0
+                    features[slot, 5] = min((modulation_efficiency_ratio - 1.0) / 3.0, 1.0)  # Mapear [1,4] -> [0,1]
+                else:
+                    features[slot, 5] = 0.0
+                
+                # DEBUG comentado para logs estruturados
+                # if slot == 0:
+                #     print(f"  Slot {slot} (disponível):")
+                #     print(f"    osnr_raw: {osnr_values[slot]:.3f} → norm: {features[slot, 0]:.6f}")
+                #     print(f"    best_mod_idx: {best_mod_idx}")
+                #     if best_mod_idx >= 0:
+                #         print(f"    osnr_margin: {osnr_margin:.3f} → norm: {features[slot, 1]:.6f}")
+                #         print(f"    best_mod_tier: {best_mod_idx}/{len(self.modulations)-1} → {features[slot, 3]:.6f}")
+                #         print(f"    spectral_eff: {spectral_efficiency:.2f}/{max_se:.2f} → {features[slot, 4]:.6f}")
+                #         print(f"    mod_eff_ratio: {modulation_efficiency_ratio:.3f} → {features[slot, 5]:.6f}")
+                #     else:
+                #         print(f"    No viable modulation for this slot")
+                #     print(f"    path_quality: {features[slot, 2]:.6f}")
+                
+            else:  # Slot indisponível
+                # Todas as features = -1 para slots indisponíveis
+                features[slot, 0] = -1.0
+                features[slot, 1] = -1.0
+                features[slot, 2] = -1.0
+                features[slot, 3] = -1.0
+                features[slot, 4] = -1.0
+                features[slot, 5] = -1.0
+        
+        return features
+
+    cdef int _get_local_block_size(self, int slot, cnp.ndarray available_slots):
+        """Retorna o tamanho do bloco livre que contém o slot dado"""
+        if available_slots[slot] == 0:
+            return 0
+            
+        cdef int start = slot
+        cdef int end = slot
+        cdef int num_slots = self.num_spectrum_resources
+        
+        # Expandir para a esquerda
+        while start > 0 and available_slots[start - 1] == 1:
+            start -= 1
+        
+        # Expandir para a direita  
+        while end < num_slots - 1 and available_slots[end + 1] == 1:
+            end += 1
+            
+        return end - start + 1
+
+    cdef cnp.ndarray _compute_path_utilizations(self):
+        """Calcula utilização atual de cada path - NOVO para load balancing"""
+        cdef cnp.ndarray utilizations = np.zeros(self.k_paths, dtype=np.float32)
+        
+        source = self.current_service.source
+        destination = self.current_service.destination
+        
+        for path_idx, route in enumerate(self.k_shortest_paths[source, destination][:self.k_paths]):
+            available_slots = self.get_available_slots(route)
+            utilization = 1.0 - np.mean(available_slots)
+            utilizations[path_idx] = utilization
+        
+        return utilizations
+
+    cdef int _count_contiguous_from_slot(self, int start_slot, cnp.ndarray available_slots):
+        """Conta slots contíguos disponíveis a partir de um slot"""
+        cdef int count = 0
+        cdef int slot = start_slot
+        
+        while slot < len(available_slots) and available_slots[slot] == 1:
+            count += 1
+            slot += 1
+        
+        return count
+
+    cdef int _count_available_positions(self, cnp.ndarray available_slots, int slots_required, str cache_key=None):
+        """Conta quantas posições válidas existem para alocar um bloco de tamanho slots_required usando máscara cacheada."""
+        cdef int total_slots = available_slots.shape[0]
+        cdef cnp.ndarray mask
+        if slots_required <= 0 or slots_required > total_slots:
+            return 0
+        if cache_key is None:
+            cache_key = f"slots_{id(available_slots)}"
+        mask = self._get_cached_window_mask(available_slots, cache_key, slots_required)
+        if mask.size == 0:
+            return 0
+        return int(mask.sum())
+
+    cdef cnp.ndarray _compute_path_modulation_features(self, list paths_info, cnp.ndarray path_utilizations):
+        """Computa features por path/modulação - K × M × 2"""
+        cdef int K = len(paths_info)
+        cdef int M = self.modulations_to_consider  
+        cdef cnp.ndarray features = np.zeros((K, M, 2), dtype=np.float32)
+        
+        # Cache para modulações
+        cdef tuple modulations = self.modulations
+        cdef double max_spectral_eff = max([mod.spectral_efficiency for mod in modulations])
+        
+        for path_idx in range(K):
+            route, available_slots = paths_info[path_idx]
+            path_length = route.length
+            cache_key = f"path_{path_idx}"
+            
+            for mod_idx in range(M):
+                if mod_idx >= len(modulations):
+                    continue
+                    
+                modulation = modulations[mod_idx]
+                
+                # Feature 0: qot_path_quality 
+                # Combina: distância + eficiência espectral + utilização
+                distance_penalty = min(path_length / 2000.0, 1.0)
+                efficiency_bonus = modulation.spectral_efficiency / max_spectral_eff
+                utilization_penalty = path_utilizations[path_idx]
+                
+                qot_quality = (efficiency_bonus * 0.5) + ((1.0 - distance_penalty) * 0.3) + ((1.0 - utilization_penalty) * 0.2)
+                features[path_idx, mod_idx, 0] = qot_quality
+                
+                # Feature 1: allocation_competitiveness
+                # Quantas posições disponíveis para esta modulação neste path
+                slots_required = self.get_number_slots(self.current_service, modulation)
+                available_positions = self._count_available_positions(available_slots, slots_required, cache_key)
+                max_possible_positions = max(1, self.num_spectrum_resources - slots_required + 1)
+                
+                competitiveness = available_positions / max_possible_positions
+                features[path_idx, mod_idx, 1] = competitiveness
+        
+        return features
+
+    cdef cnp.ndarray _compute_global_slot_features_optimized(self, cnp.ndarray available_slots_global):
+        """Computa features globais otimizadas por slot - S × 4 (removeu utilization_context)"""
+        cdef int num_slots = len(available_slots_global)
+        cdef cnp.ndarray features = np.zeros((num_slots, 4), dtype=np.float32)
+        
+        # Calcular fragmentação global uma vez
+        cdef cnp.ndarray fragmentation = self._get_cached_fragmentation(available_slots_global, "global_optimized")
+        
+        for slot in range(num_slots):
+            if available_slots_global[slot] == 1:  # Disponível
+                # Feature 0: is_available
+                features[slot, 0] = 1.0
+                
+                # Feature 1: local_block_size
+                local_block_size = self._get_local_block_size(slot, available_slots_global)
+                features[slot, 1] = min(local_block_size / 50.0, 1.0)
+                
+                # Feature 2: fragmentation_local
+                features[slot, 2] = fragmentation[slot]
+                
+                # Feature 3: edge_proximity  
+                edge_distance = min(slot, num_slots - 1 - slot) / (num_slots / 2.0)
+                features[slot, 3] = edge_distance
+                
+            else:  # Slot indisponível
+                features[slot, 0] = 0.0
+                features[slot, 1] = -1.0
+                features[slot, 2] = -1.0
+                features[slot, 3] = -1.0
+        
+        return features
+
+    cdef cnp.ndarray _compute_path_slot_features_optimized(self, list paths_info, cnp.ndarray path_utilizations):
+        """Computa features otimizadas por path/slot - K × S × 3"""
+        cdef int K = len(paths_info) 
+        cdef int S = self.num_spectrum_resources
+        cdef cnp.ndarray features = np.zeros((K, S, 3), dtype=np.float32)
+        
+        # Calcular utilização média dos outros paths para load balancing
+        cdef double mean_other_utilization
+        
+        for path_idx in range(K):
+            route, available_slots = paths_info[path_idx]
+            
+            # OSNR vectorizado para todo o path de uma vez (OTIMIZAÇÃO)
+            osnr_values = self._compute_slot_osnr_vectorized(route, available_slots)
+            
+            # Normalização OSNR para este path
+            valid_osnr = osnr_values[osnr_values >= 0]
+            if len(valid_osnr) > 0:
+                osnr_min, osnr_max = np.min(valid_osnr), np.max(valid_osnr)
+                osnr_range = osnr_max - osnr_min if osnr_max > osnr_min else 1.0
+            else:
+                osnr_min, osnr_max, osnr_range = 0.0, 1.0, 1.0
+            
+            # Load balancing: utilização média dos outros paths
+            other_paths_util = np.concatenate([path_utilizations[:path_idx], path_utilizations[path_idx+1:]])
+            mean_other_utilization = np.mean(other_paths_util) if len(other_paths_util) > 0 else 0.0
+            current_path_utilization = path_utilizations[path_idx]
+            
+            for slot in range(S):
+                if available_slots[slot] == 1:  # Disponível
+                    # Feature 0: osnr_normalized (mantida)
+                    if osnr_values[slot] >= 0:
+                        features[path_idx, slot, 0] = (osnr_values[slot] - osnr_min) / osnr_range
+                    else:
+                        features[path_idx, slot, 0] = 0.0
+                    
+                    # Feature 1: contiguous_capacity (NOVA)
+                    contiguous_from_slot = self._count_contiguous_from_slot(slot, available_slots)
+                    features[path_idx, slot, 1] = min(contiguous_from_slot / 50.0, 1.0)
+                    
+                    # Feature 2: load_balancing_value (NOVA)
+                    load_imbalance = mean_other_utilization - current_path_utilization
+                    load_balancing_value = min(max(0.5 + load_imbalance, 0.0), 1.0)
+                    features[path_idx, slot, 2] = load_balancing_value
+                    
+                else:  # Indisponível
+                    features[path_idx, slot, 0] = -1.0
+                    features[path_idx, slot, 1] = -1.0  
+                    features[path_idx, slot, 2] = -1.0
+        
+        return features
+
 
     cpdef public is_path_free(self, path, initial_slot: int, number_slots: int):
         end = initial_slot + number_slots
@@ -1309,26 +2360,102 @@ cdef class QRMSAEnv:
                 return False
         return True
 
-    cpdef double reward(self):
-        cdef double reward_value = 0.0
-        cdef double failed_ratio = (self.episode_services_processed - self.episode_services_accepted) / float(self.episode_services_processed)
+    cdef double _compute_fragmentation_score_from_info(self, dict info):
+        """Calcula score de fragmentação usando métricas já computadas no step()"""
+        cdef double shannon, route_cuts_norm, route_rss, frag_score
+        cdef int num_links, route_cuts
+        
+        # Obter métricas do dict info (já calculadas no step())
+        shannon = info.get("fragmentation_shannon_entropy", 0.0)
+        route_cuts = info.get("fragmentation_route_cuts", 0)
+        route_rss = info.get("fragmentation_route_rss", 0.0)
+        
+        # Normalizar route_cuts pelo número de links (tipicamente 0-2 cuts por link)
+        num_links = self.topology.number_of_edges()
+        if num_links > 0:
+            route_cuts_norm = min(<double>route_cuts / (<double>num_links * 2.0), 1.0)
+        else:
+            route_cuts_norm = 0.0
+        
+        # Score combinado: pesos balanceados
+        # shannon: [0,1] - maior = mais fragmentado
+        # route_cuts_norm: [0,1] - maior = mais cortes
+        # route_rss: [0,1] - maior = mais fragmentado
+        frag_score = 0.4 * shannon + 0.3 * route_cuts_norm + 0.3 * route_rss
+        
+        return frag_score
 
+    cpdef double reward(self, dict info=None):
+        """
+        Reward function otimizada para PPO.
+        
+        Para serviços ACEITOS:
+            reward = 1.0 + 0.5×(SE/SE_max) - 0.3×frag_score - 0.15×osnr_waste
+            
+        Para BLOQUEIOS:
+            reject = -1.0 (ação consciente de rejeitar)
+            block_recursos = -1.5 (impossível alocar)
+            block_osnr = -2.0 (qualidade insuficiente)
+        
+        NOTA: Não usa failed_ratio pois PPO já gerencia penalidades adaptativas
+              através do advantage normalization e clipping.
+        """
+        cdef double reward_value
+        cdef double modulation_bonus, fragmentation_penalty, osnr_waste_penalty
+        cdef double current_se, max_se, se_normalized
+        cdef double osnr_margin, osnr_waste_normalized
+        cdef double frag_score
+        
+        # ====================================
+        # CASO 1: SERVIÇO NÃO ACEITO
+        # ====================================
         if not self.current_service.accepted:
-            return -3.0 * (1.0 + failed_ratio)
-
+            # Penalidades fixas e simples (PPO gerencia o resto)
+            if self.current_service.blocked_due_to_resources:
+                return -1.8  # Bloqueio por falta de recursos
+            elif self.current_service.blocked_due_to_osnr:
+                return -1.8  # Bloqueio por OSNR (pior, pois indica má escolha de path/mod)
+            else:
+                return -2.0  # Reject explícito (ação válida, menor penalidade)
+        
         reward_value = 1.0
 
-        cdef double current_se = self.current_service.current_modulation.spectral_efficiency
-        reward_value += 0.1 * current_se
+        current_se = self.current_service.current_modulation.spectral_efficiency
+        max_se = max([mod.spectral_efficiency for mod in self.modulations])
+        se_normalized = current_se / max_se if max_se > 0 else 0.0
+        modulation_bonus = 0.5 * se_normalized
+        
+        if info is not None:
+            frag_score = self._compute_fragmentation_score_from_info(info)
+        else:
+            frag_score = 0.0 
+        fragmentation_penalty = 0.3 * frag_score
 
-        cdef double osnr_margin = self.current_service.OSNR - self.current_service.current_modulation.minimum_osnr
-        if osnr_margin > 0:
-            reward_value -= 0.1 * (osnr_margin ** 0.5)
-
-        if reward_value > 3.0:
-            reward_value = 3.0
-        elif reward_value < -3.0:
-            reward_value = -3.0
+        if self.current_service.current_modulation != self.modulations[self.max_modulation_idx]:
+            osnr_margin = self.current_service.OSNR - self.current_service.current_modulation.minimum_osnr
+            osnr_waste_normalized = min(max(osnr_margin / 3.0, 0.0), 3.0)
+            osnr_waste_penalty = 0.20 * osnr_waste_normalized
+        else:
+            osnr_waste_penalty = 0.0  
+        
+        reward_value = reward_value + modulation_bonus - fragmentation_penalty - osnr_waste_penalty
+        
+        if hasattr(self, 'debug_reward') and self.debug_reward:
+            print(f"  💰 REWARD DEBUG (service {self.current_service.service_id}):")
+            print(f"     Base: +1.0")
+            print(f"     Modulation ({self.current_service.current_modulation.name}, SE={current_se:.2f}): +{modulation_bonus:.3f}")
+            print(f"     Fragmentation (score={frag_score:.3f}): -{fragmentation_penalty:.3f}")
+            print(f"     OSNR Waste (margin={osnr_margin:.2f}dB): -{osnr_waste_penalty:.3f}")
+            print(f"     ➜ TOTAL: {reward_value:.3f}")
+        
+        # Optional: Clipping suave para evitar valores extremos
+        # (PPO funciona melhor com rewards em range razoável)
+        if reward_value > 2.0:
+            reward_value = 2.0
+        elif reward_value < -2.0:
+            reward_value = -2.0
+        
+        return reward_value
 
     
     cpdef _provision_path(self, object path, cnp.int64_t initial_slot, int number_slots):
@@ -1562,8 +2689,9 @@ cdef class QRMSAEnv:
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
+    @cython.cdivision(True)
     cpdef cnp.ndarray get_available_slots(self, object path):
-        cdef Py_ssize_t i, n
+        cdef Py_ssize_t i, j, n
         cdef tuple node_list = path.node_list
         cdef cnp.ndarray available_slots_matrix
         cdef cnp.ndarray product
@@ -1571,6 +2699,10 @@ cdef class QRMSAEnv:
         cdef int[:] product_view
         cdef Py_ssize_t num_rows, num_cols
         cdef dict link_data
+        cdef int path_k = path.k
+        cdef str cache_key
+        
+        cache_key = f"avail_slots_{path_k}"
 
         n = len(node_list) - 1
 
@@ -1581,6 +2713,12 @@ cdef class QRMSAEnv:
             indices[i] = link_data['index']
 
         available_slots_matrix = self.topology.graph["available_slots"][indices, :]
+        current_signature = int(np.sum(available_slots_matrix))
+
+        if cache_key in self.available_slots_cache:
+            cached_signature = self.available_slots_signature_cache.get(cache_key, None)
+            if cached_signature is not None and cached_signature == current_signature:
+                return self.available_slots_cache[cache_key]
 
         num_rows = available_slots_matrix.shape[0]
         num_cols = available_slots_matrix.shape[1]
@@ -1592,8 +2730,12 @@ cdef class QRMSAEnv:
 
         for i in range(1, num_rows):
             for j in range(num_cols):
-                product_view[j] *= slots_view[i, j]
+                if product_view[j] == 0:
+                    continue
+                product_view[j] = slots_view[i, j]
 
+        self.available_slots_cache[cache_key] = product
+        self.available_slots_signature_cache[cache_key] = current_signature
         return product
     
 

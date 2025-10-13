@@ -1,3 +1,4 @@
+import gc
 import time
 from typing import Optional, Tuple, Any, SupportsFloat
 
@@ -63,10 +64,8 @@ class QRMSAEnvWrapper(gym.Env):
             pass
 
     def close(self):
-        if hasattr(self.env, 'close'):
-            return self.env.close()
-        else:
-            pass
+        self.env = None
+        gc.collect()
 
 
     def action_masks(self):

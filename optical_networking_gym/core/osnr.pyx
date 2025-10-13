@@ -367,6 +367,135 @@ cpdef double calculate_osnr_observation(
 
     # GSNR final
     gsnr = 10.0 * log10(1.0 / acc_gsnr)
-    # Normalização
-    cdef double normalized_gsnr = np.round((gsnr - gsnr_th) / abs(gsnr_th), 10)
+    # Normalização com verificação para evitar divisão por zero
+    cdef double normalized_gsnr
+    if abs(gsnr_th) < 1e-10:  # Se gsnr_th é praticamente zero
+        normalized_gsnr = gsnr  # Retornar valor não normalizado
+    else:
+        normalized_gsnr = np.round((gsnr - gsnr_th) / abs(gsnr_th), 10)
     return normalized_gsnr
+
+
+#############################
+# 4) compute_slot_osnr_vectorized
+#############################
+cpdef np.ndarray[np.float64_t, ndim=1] compute_slot_osnr_vectorized(
+    object env,  # QRMSAEnv
+    object path,  # Path object 
+    np.ndarray[np.int32_t, ndim=1] available_slots,
+    str qot_constraint = "ASE+NLI"
+):
+    """
+    Calcula OSNR para todos os slots de uma vez usando vetorização.
+    Movida do qrmsa.pyx para melhor organização.
+    
+    Args:
+        env: QRMSAEnv environment
+        path: Path object
+        available_slots: Array de slots disponíveis
+        qot_constraint: Tipo de constraint ("ASE+NLI", "DIST", etc.)
+    """
+    cdef int num_slots = available_slots.shape[0]
+    cdef np.ndarray[np.float64_t, ndim=1] osnr_values = np.zeros(num_slots, dtype=np.float64)
+    cdef double frequency_slot_bandwidth = env.channel_width * 1e9
+    cdef double launch_power = 10 ** ((env.launch_power_dbm - 30) / 10)
+    cdef int slot
+    cdef double service_center_frequency
+    cdef double gsnr_db, ase_db, nli_db
+    
+    # Criar um serviço temporário para simular cada slot
+    cdef object temp_service = type('TempService', (), {
+        'path': path,
+        'initial_slot': 0,
+        'number_slots': 1,
+        'center_frequency': 0.0,
+        'bandwidth': frequency_slot_bandwidth,
+        'launch_power': launch_power,
+        'service_id': getattr(env.current_service, 'service_id', -999)  # ID único para evitar conflitos
+    })()
+    
+    # Calcular OSNR para cada slot individualmente usando a função original
+    for slot in range(num_slots):
+        if available_slots[slot] == 1:  # Slot disponível
+            service_center_frequency = (
+                env.frequency_start + 
+                (frequency_slot_bandwidth * slot) + 
+                (frequency_slot_bandwidth / 2.0)
+            )
+            
+            # Configurar serviço temporário para este slot
+            temp_service.initial_slot = slot
+            temp_service.center_frequency = service_center_frequency
+            
+            # Usar função original calculate_osnr que retorna valores em dB
+            gsnr_db, ase_db, nli_db = calculate_osnr(env, temp_service, qot_constraint)
+            osnr_values[slot] = gsnr_db  # Retornar valor em dB
+        else:
+            osnr_values[slot] = -1.0  # Slot ocupado
+    
+    return osnr_values
+
+
+#############################
+# 5) validate_osnr_vectorized
+#############################
+cpdef bint validate_osnr_vectorized(
+    object env,
+    object path,
+    np.ndarray[np.int32_t, ndim=1] available_slots,
+    double tolerance=1e-6,
+    str qot_constraint="ASE+NLI"
+):
+    """
+    Valida a função OSNR vetorizada comparando com a implementação original.
+    Retorna True se as diferenças estão dentro da tolerância especificada.
+    """
+    cdef int num_slots = available_slots.shape[0]
+    cdef np.ndarray[np.float64_t, ndim=1] vectorized_values
+    cdef np.ndarray[np.float64_t, ndim=1] individual_values = np.zeros(num_slots, dtype=np.float64)
+    cdef double frequency_slot_bandwidth = env.channel_width * 1e9
+    cdef double launch_power = 10 ** ((env.launch_power_dbm - 30) / 10)
+    cdef double gsnr_th = 10.0
+    cdef int slot
+    cdef double service_center_frequency
+    cdef double max_diff = 0.0
+    cdef double diff
+    cdef int errors = 0
+    
+    print(f"[DEBUG] Validating OSNR vectorized function...")
+    
+    # Calcular usando função vetorizada
+    vectorized_values = compute_slot_osnr_vectorized(env, path, available_slots, qot_constraint)
+    
+    # Calcular individualmente para comparação
+    for slot in range(num_slots):
+        if available_slots[slot] == 1:
+            service_center_frequency = (
+                env.frequency_start + 
+                (frequency_slot_bandwidth * slot) + 
+                (frequency_slot_bandwidth / 2.0)
+            )
+            
+            individual_values[slot] = calculate_osnr_observation(
+                env,
+                path.links,
+                frequency_slot_bandwidth,
+                service_center_frequency,
+                env.current_service.service_id,
+                launch_power,
+                gsnr_th
+            )
+        else:
+            individual_values[slot] = -1.0
+    
+    # Comparar resultados
+    for slot in range(num_slots):
+        diff = abs(vectorized_values[slot] - individual_values[slot])
+        if diff > tolerance:
+            print(f"[VALIDATION ERROR] Slot {slot}: vectorized={vectorized_values[slot]:.6f}, individual={individual_values[slot]:.6f}, diff={diff:.6f}")
+            errors += 1
+        if diff > max_diff:
+            max_diff = diff
+    
+    print(f"[DEBUG] Validation complete: {errors} errors, max_diff={max_diff:.6f}")
+    return errors == 0
