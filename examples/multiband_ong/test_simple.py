@@ -35,7 +35,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(1400, 1401, 50)  
+        return np.arange(400, 1401, 100)  
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -70,7 +70,7 @@ def print_link_slots(env, stage):
     for u, v in env.env.topology.edges():
         idx = env.env.topology[u][v]["index"]
         slots = env.env.topology.graph["available_slots"][idx]
-        print(f"Link {u}->{v} slots: {''.join(map(str, slots.tolist()))}")
+        print(f"Link {u}->{v} slots: {"".join(map(str, slots.tolist()))}")
 
 # Configuração de logging, semente e argumentos de entrada
 logging.getLogger("rmsaenv").setLevel(logging.INFO)
@@ -140,13 +140,12 @@ def run_environment_with_monitoring(
     gen_observation: bool,
     band_specs: List[dict] = None,
     debug: bool = False,
+    max_span_length: float = 100.
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
     Baseado na função run_environment do graph_load.py
     """
-    
-
     
     # Configurações do ambiente - Usando band_specs diretamente se fornecido
     if band_specs:
@@ -204,6 +203,35 @@ def run_environment_with_monitoring(
     
     with open(f"results/{monitor_final_name}", "wt") as f:
         f.write(f"# Date: {datetime.now()}\n")
+        f.write(f"# Topology: {topology.name}\n")
+        f.write(f"# Heuristic: {get_heuristic_function(heuristic_index).__name__}\n")
+        f.write(f"# Episodes: {n_eval_episodes}\n")
+        f.write(f"# Episode Length: {episode_length}\n")
+        f.write(f"# Bit Rates: {bit_rates} Gbps\n")
+        f.write(f"# Modulations: {[m.name for m in env.env.modulations]}\n")
+        f.write(f"# Span Length: {max_span_length} km\n")
+        f.write(f"\n# Band Specifications\n")
+        
+        band_names = [spec['name'] for spec in band_specs]
+        f.write(f"# | | {" | ".join(band_names)} |\n")
+        f.write(f"# |---|{"---|" * len(band_specs)}\n")
+        
+        start_thz_row = " | ".join([str(spec['start_thz']) for spec in band_specs])
+        f.write(f"# | Frequência Inicial (Thz) | {start_thz_row} |\n")
+        
+        noise_figure_row = " | ".join([str(spec['noise_figure_db']) for spec in band_specs])
+        f.write(f"# | Figura de Ruído (dB) | {noise_figure_row} |\n")
+        
+        attenuation_row = " | ".join([str(spec['attenuation_db_km']) for spec in band_specs])
+        f.write(f"# | Coeficiente de Atenuação (dB/km) | {attenuation_row} |\n")
+        
+        slots_row = " | ".join([str(spec['num_slots']) for spec in band_specs])
+        f.write(f"# | Número de Slots | {slots_row} |\n")
+        
+        calculated_bw = [spec['num_slots'] * frequency_slot_bandwidth for spec in band_specs]
+        bw_row = " | ".join([f'{bw:.2e}' for bw in calculated_bw])
+        f.write(f"# | Bandwidth (Hz) | {bw_row} |\n\n")
+
         # Cabeçalho completo igual ao que é salvo nos dados
         header = (
             "episode,service_blocking_rate,episode_service_blocking_rate,"
@@ -256,64 +284,6 @@ def run_environment_with_monitoring(
 
     print(f"\nFinalizado! Resultados salvos em: results/{monitor_final_name}")
 
-def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=True):
-    """Cria o ambiente de teste baseado na configuração do graph_load.py"""
-    
-    # Determinar o arquivo de topologia
-    if topology_name.endswith('.txt'):
-        topo_file = f"examples/topologies/{topology_name}"
-    else:
-        topo_file = f"examples/topologies/{topology_name}.txt"
-    
-    # Verificar se o arquivo existe
-    if not os.path.exists(topo_file):
-        raise FileNotFoundError(f"Arquivo de topologia '{topo_file}' não encontrado.")
-    
-    # Usar modulações completas
-    mods = define_modulations()
-    
-    # Criar topologia
-    topology = get_topology(
-        topo_file, None, mods,
-        max_span_length=100, 
-        default_attenuation=0.2,
-        default_noise_figure=4.5, 
-        k_paths=2  # Reduzido para compatibilidade com redes menores
-    )
-    
-    # Configuração de banda multibanda baseada no graph_load.py
-    band_specs = [
-        {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.20},
-        {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-        {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.22},
-    ]
-    
-    # Configurações do ambiente usando band_specs (padrão do graph_load.py)
-    env_args = dict(
-        topology=topology,
-        band_specs=band_specs,
-        seed=10,
-        allow_rejection=True,
-        load=1000,
-        episode_length=episode_length,
-        launch_power_dbm=0,
-        frequency_slot_bandwidth=12.5e9,
-        bit_rate_selection="discrete",
-        bit_rates=(48, 120),
-        margin=0,
-        measure_disruptions=False,
-        file_name="",
-        k_paths=2,  # Reduzido para compatibilidade com redes menores
-        # modulations_to_consider removido - deixar o ambiente usar o padrão
-        defragmentation=False,
-        n_defrag_services=0,
-        gen_observation=False,  # SOLUÇÃO: Desabilitar observação resolve o IndexError
-        # O erro ocorria em decimal_to_array quando tentava acessar modulation IDs
-        # que não existiam no array allowed_mods. Com gen_observation=False,
-        # o ambiente não tenta gerar observações e evita esse problema.
-    )
-    
-    return env_args, debug
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -345,7 +315,7 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument('-mb', '--bands', nargs='+', type=str, 
-                        default=['BandaC+L'],
+                        default=['BandaC+L+S'],
                         choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
                         help='Especifica uma ou mais bandas para simular')
     parser.add_argument(
@@ -366,6 +336,9 @@ def main():
     """Função principal com opções de linha de comando baseada no graph_load.py"""
     args = parse_arguments()
     
+    # Hardcode topology to nobel-eu.xml
+    args.topology_file = "nobel-eu.xml"
+
     # Usar modulações completas
     cur_modulations = define_modulations()
 
@@ -390,6 +363,11 @@ def main():
             "BandaC+L": [
                 {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
                 {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
+            ],
+            "BandaC+L+S": [
+                {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
+                {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+                {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
             ]
         }
     else:
@@ -406,45 +384,48 @@ def main():
     # Obter as cargas baseadas na topologia
     loads = get_loads(args.topology_file)
 
-    for band_name in args.bands:
-        band_specs = band_specs_options[band_name]
-        
-        # Criar topologia
-        topology = get_topology(
-            topology_path,
-            None,
-            cur_modulations,
-            100,  # max_span_length
-            0.2,  # default_attenuation
-            4.5,  # default_noise_figure
-            2  # k_paths
+    # Use the C+L+S band configuration
+    band_specs = band_specs_options["BandaC+L+S"]
+    
+    max_span_length = 100.
+    
+    # Criar topologia
+    topology = get_topology(
+        topology_path,
+        None,
+        cur_modulations,
+        max_span_length,
+        0.2,  # default_attenuation
+        4.5,  # default_noise_figure
+        2  # k_paths
+    )
+    
+    # Iterar sobre todas as cargas da topologia
+    for current_load in loads:
+        # Executar simulação
+        run_environment_with_monitoring(
+            n_eval_episodes=args.num_episodes,
+            heuristic_index=args.heuristic_index,
+            monitor_file_name=None,
+            topology=topology,
+            seed=seed,
+            allow_rejection=True,
+            load=current_load,
+            episode_length=args.episode_length,
+            launch_power_dbm=args.power,
+            frequency_slot_bandwidth=12.5e9,
+            bit_rate_selection="discrete",
+            bit_rates=(48, 120),
+            margin=0,
+            file_name="",
+            measure_disruptions=False,
+            defragmentation=False,
+            n_defrag_services=0,
+            gen_observation=False,
+            band_specs=band_specs,
+            debug=args.debug,
+            max_span_length=max_span_length
         )
-        
-        # Iterar sobre todas as cargas da topologia
-        for current_load in loads:
-            # Executar simulação
-            run_environment_with_monitoring(
-                n_eval_episodes=args.num_episodes,
-                heuristic_index=args.heuristic_index,
-                monitor_file_name=None,
-                topology=topology,
-                seed=seed,
-                allow_rejection=True,
-                load=current_load,
-                episode_length=args.episode_length,
-                launch_power_dbm=args.power,
-                frequency_slot_bandwidth=12.5e9,
-                bit_rate_selection="discrete",
-                bit_rates=(48, 120),
-                margin=0,
-                file_name="",
-                measure_disruptions=False,
-                defragmentation=False,
-                n_defrag_services=0,
-                gen_observation=False,
-                band_specs=band_specs,
-                debug=args.debug
-            )
 
     print("\nTodas as simulações foram executadas.")
 
