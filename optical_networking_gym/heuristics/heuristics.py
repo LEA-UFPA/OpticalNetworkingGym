@@ -101,24 +101,6 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     
     return action_index
 
-# def decimal_to_array(env: QRMSAEnv, decimal: int, max_values: list[int] = None) -> list[int]:
-#     if max_values is None:
-#         max_values = [env.k_paths, len(env.modulations), env.num_spectrum_resources]
-    
-#     array = []
-#     for max_val in reversed(max_values):
-#         array.insert(0, decimal % max_val)
-#         decimal //= max_val
-#     print(f"Decimal converted to array {array}")
-
-#     # Mapeia o índice relativo de modulação para o índice absoluto
-#     allowed_mods = list(range(env.max_modulation_idx, env.max_modulation_idx - env.modulations_to_consider, -1))
-    
-#     # O mapeamento de modulação acontece para o segundo índice (array[1])
-#     array[1] = allowed_mods[array[1]]
-#     print(f"Modulation index mapped to absolute index: {array}")
-#     return array
-
 
 
 def heuristic_from_mask(env: Env, mask: np.ndarray) -> int:
@@ -314,7 +296,7 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
     return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
 
 
-def heuristic_highest_snr(env: Env) -> int:
+def heuristic_highest_snr(env: Env) -> int:  # não funciona
     best_osnr = -np.inf
     best_action = None
     any_blocked_resources = False
@@ -372,7 +354,7 @@ def heuristic_highest_snr(env: Env) -> int:
             any_blocked_resources = False
         return env.action_space.n - 1, any_blocked_resources, any_blocked_osnr
 
-def heuristic_lowest_fragmentation(env: Env) -> tuple[int, bool, bool]:
+def heuristic_lowest_fragmentation(env: Env) -> tuple[int, bool, bool]:  # não funciona
     sim_env = get_qrmsa_env(env)
     service = sim_env.current_service
     source, destination = service.source, service.destination
@@ -589,7 +571,7 @@ def best_modulation_load_balancing(
 
 def load_balancing_best_modulation(
     env: Env,
-) -> Optional[int]:
+) -> Optional[int]:  # não funciona
     """
     Balanceia a carga selecionando a melhor modulação com a menor carga na rota.
     
@@ -748,7 +730,7 @@ def heuristic_mscl_sequential_simplified(env: Env) -> tuple[int, bool, bool]:
         any_blocked_resources = False
     return sim_env.action_space.n - 1, any_blocked_resources, any_blocked_osnr
 
-def heuristic_priority_band_C_then_L(env: Env) -> tuple[int, bool, bool]:
+def heuristic_priority_band_C_then_L(env: Env) -> tuple[int, bool, bool]:  # não funciona
     """
     Tenta alocar o serviço na banda C enquanto a ocupação for < 90%.
     Se >= 90%, tenta na banda L.
@@ -945,8 +927,11 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 # para o slot relativo dentro da faixa da banda
                 slot_in_band = global_candidate_start - band.slot_start
                 
-                # Verificar se o slot relativo está dentro dos limites da banda uniforme
-                if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+                # Verificar se o slot relativo está dentro dos limites reais da banda
+                if slot_in_band < 0 or slot_in_band >= band.num_slots:
+                    continue
+
+                if not band.contains_slot_range(global_candidate_start, required_slots):
                     continue
                 
                 # Configurar o serviço para teste de OSNR
@@ -985,7 +970,29 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                         action_index = get_multiband_action_index(
                             sim_env, path_idx, band_idx, modulation_idx, slot_in_band
                         )
+
+                        # Validar combinação decodificando com a mesma lógica do ambiente
+                        decoded = sim_env.decimal_to_array(
+                            action_index,
+                            [sim_env.k_paths, sim_env.num_bands, sim_env.modulations_to_consider, sim_env.bands[0].num_slots]
+                        )
+                        decoded_path_idx = decoded[0]
+                        decoded_band_idx = decoded[1]
+                        decoded_slot_rel = decoded[3]
                         
+                        paths_for_pair = sim_env.k_shortest_paths[
+                            sim_env.current_service.source,
+                            sim_env.current_service.destination
+                        ]
+                        if decoded_path_idx >= len(paths_for_pair):
+                            continue
+
+                        decoded_band = sim_env.bands[decoded_band_idx]
+                        decoded_global_slot = decoded_band.slot_start + decoded_slot_rel
+
+                        if not decoded_band.contains_slot_range(decoded_global_slot, required_slots):
+                            continue
+
                         # Verificar se a ação está válida
                         if action_index >= sim_env.action_space.n:
                             print(f"ERRO: action_index {action_index} >= action_space.n {sim_env.action_space.n}")
