@@ -106,7 +106,7 @@ def get_heuristic_function(heuristic_index: int):
 
 # Topology load configurations
 TOPOLOGY_LOADS = {
-    "nobel-eu.xml": (400, 1401, 100),
+    "nobel-eu.xml": (400, 2101, 100),
     "germany50.xml": (100, 1501, 100),
     "janos-us.xml": (100, 601, 50),
     "nsfnet_chen.txt": (100, 601, 50),

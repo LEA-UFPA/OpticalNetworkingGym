@@ -366,8 +366,8 @@ def main():
             ],
             "BandaC+L+S": [
                 {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-                {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
-                {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
+                {"name": "L", "start_thz": 185.83, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
+                {"name": "S", "start_thz": 197.22, "num_slots": 344, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
             ]
         }
     else:
