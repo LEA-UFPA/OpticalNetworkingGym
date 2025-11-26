@@ -8,6 +8,7 @@ import os
 import random
 import sys
 import time
+import shutil
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
 from multiprocessing import Pool, cpu_count
@@ -36,7 +37,7 @@ from optical_networking_gym.heuristics.heuristics import (
 )
 
 try:
-    from plot import generate_plot
+    from plotAN import gerar_grafico_probabilidade_bloqueio as generate_plot
 except ImportError as e:
     print(f"Warning: Could not import plotting module. Plotting will be disabled.")
     print(f"  Error: {e}")
@@ -52,6 +53,10 @@ FREQUENCY_SLOT_BANDWIDTH = 12.5e9
 # ===================================================
 # Helper Functions (Adapted from test_simple.py)
 # ===================================================
+
+def clear_screen():
+    """Clears the terminal screen."""
+    os.system('cls' if os.name == 'nt' else 'clear')
 
 def get_loads(topology_name: str) -> np.ndarray:
     """Returns appropriate loads for each topology"""
@@ -164,22 +169,7 @@ def write_episode_results(f, ep, info, modulations, ep_time, mean_gsnr):
 
     f.write(row)
 
-def get_tqdm_position():
-    """
-    Determines the position of the progress bar based on the worker process.
-    Sequential execution (MainProcess) gets position 0.
-    Worker processes get position = worker_id.
-    """
-    p_name = multiprocessing.current_process().name
-    if p_name == "MainProcess":
-        return 0
-    else:
-        # Expected format: "ForkPoolWorker-X" or "SpawnPoolWorker-X"
-        try:
-            # Extract number from name
-            return int(p_name.split('-')[-1])
-        except ValueError:
-            return 1 # Fallback
+
 
 def run_environment_with_monitoring(
     n_eval_episodes: int,
@@ -255,9 +245,11 @@ def run_environment_with_monitoring(
     os.makedirs(output_dir, exist_ok=True)
     
     if show_progress:
-        tqdm.write(f"Starting simulation for Load: {load}, Heuristic: {heuristic_index}, Episodes: {n_eval_episodes}")
+        # tqdm.write(f"Starting simulation for Load: {load}, Heuristic: {heuristic_index}, Episodes: {n_eval_episodes}")
+        pass
     else:
-        print(f"Starting simulation for Load: {load}, Heuristic: {heuristic_index}, Episodes: {n_eval_episodes}")
+        # print(f"Starting simulation for Load: {load}, Heuristic: {heuristic_index}, Episodes: {n_eval_episodes}")
+        pass
     
     with open(f"{output_dir}/{monitor_final_name}", "wt") as f:
         write_csv_header(
@@ -305,9 +297,11 @@ def run_environment_with_monitoring(
             pbar.close()
             
     if show_progress:
-        tqdm.write(f"Finished! Results saved to: {output_dir}/{monitor_final_name}")
+        # tqdm.write(f"Finished! Results saved to: {output_dir}/{monitor_final_name}")
+        pass
     else:
-        print(f"Finished! Results saved to: {output_dir}/{monitor_final_name}")
+        # print(f"Finished! Results saved to: {output_dir}/{monitor_final_name}")
+        pass
 
 def get_band_specs(args: argparse.Namespace) -> List[dict]:
     """
@@ -375,9 +369,9 @@ def run_single_load(args_tuple):
     """
     (n_eval_episodes, heuristic_index, topology, seed, allow_rejection, load, episode_length,
      launch_power_dbm, frequency_slot_bandwidth, bit_rates, measure_disruptions,
-     defragmentation, n_defrag_services, band_specs, debug, max_span_length) = args_tuple
+     defragmentation, n_defrag_services, band_specs, debug, max_span_length, tqdm_pos) = args_tuple
     
-    tqdm_pos = get_tqdm_position()
+    # tqdm_pos = get_tqdm_position()
     
     run_environment_with_monitoring(
         n_eval_episodes=n_eval_episodes,
@@ -406,6 +400,20 @@ def run_single_load(args_tuple):
 # Main CLI Logic
 # ===================================================
 
+def clean_results_directory():
+    """Removes the results directory and recreates it."""
+    if os.path.exists(RESULTS_DIR):
+        print(f"Cleaning results directory: {RESULTS_DIR}...")
+        try:
+            shutil.rmtree(RESULTS_DIR)
+            print("Results directory cleaned.")
+        except Exception as e:
+            print(f"Error cleaning results directory: {e}")
+    
+    # Recreate it immediately to avoid errors
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='CLI for OpticalNetworkingGym Simulator',
@@ -418,6 +426,7 @@ def parse_arguments() -> argparse.Namespace:
     sim_group.add_argument('-l', '--episode-length', type=int, default=100000, help='Arrivals per episode')
     sim_group.add_argument('-s', '--seed', type=int, default=50, help='Random seed')
     sim_group.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
+    sim_group.add_argument('--clean', action='store_true', help='Clean results directory before running')
 
     # Topology
     topo_group = parser.add_argument_group('Topology')
@@ -505,6 +514,7 @@ def get_user_input(prompt: str, default: str = None, value_type: type = str) -> 
             print(f"Invalid input. Expected type {value_type.__name__}.")
 
 def interactive_mode(args: argparse.Namespace) -> argparse.Namespace:
+    clear_screen()
     print("\n" + "="*40)
     print("   OpticalNetworkingGym Interactive Mode   ")
     print("="*40)
@@ -513,9 +523,14 @@ def interactive_mode(args: argparse.Namespace) -> argparse.Namespace:
     print("\nAction:")
     print("  1. Run Simulation")
     print("  2. Compare/Plot Existing Results")
-    action = get_user_choice(["Run Simulation", "Compare/Plot Existing Results"], "Select Action")
+    print("  3. Clean Results Directory")
+    action = get_user_choice(["Run Simulation", "Compare/Plot Existing Results", "Clean Results Directory"], "Select Action")
     
-    if action == "Compare/Plot Existing Results":
+    if action == "Clean Results Directory":
+        clean_results_directory()
+        # Ask what to do next
+        return interactive_mode(args)
+    elif action == "Compare/Plot Existing Results":
         args.skip_sim = True
     else:
         args.skip_sim = False
@@ -525,6 +540,7 @@ def interactive_mode(args: argparse.Namespace) -> argparse.Namespace:
     topologies_dir = os.path.join(script_dir, "..", "topologies")
     topologies = [f for f in os.listdir(topologies_dir) if f.endswith(('.xml', '.txt'))]
     if topologies:
+        clear_screen()
         args.topology = get_user_choice(sorted(topologies), "Select Topology")
     else:
         print("No topology files found. Using default.")
@@ -534,23 +550,28 @@ def interactive_mode(args: argparse.Namespace) -> argparse.Namespace:
 
     # Heuristic
     heuristics = ['first_fit', 'highest_snr', 'lowest_fragmentation', 'load_balancing', 'priority_c_l', 'best_band']
+    clear_screen()
     args.heuristic = get_user_choice(heuristics, "Select Heuristic")
 
     # Bands
     bands = ['BandaC', 'BandaL', 'BandaS', 'BandaC+L', 'BandaC+L+S']
     # Show default slots in help?
     # It's hard to show dynamic slots here without clutter.
+    clear_screen()
     args.bands = get_user_choice(bands, "Select Bands")
 
     # Load
+    clear_screen()
     print("\nLoad Configuration:")
     print("  Format: single value (e.g., 100) or range start:stop:step (e.g., 100:1000:100)")
     args.load = get_user_input("Enter Load", default="100:1000:100")
 
     # Episodes
+    clear_screen()
     args.episodes = get_user_input("Number of Episodes", default=5, value_type=int)
 
     # Advanced Options
+    clear_screen()
     if get_user_input("\nConfigure advanced options? (y/N)", default="n", value_type=bool):
         args.episode_length = get_user_input("Episode Length", default=100000, value_type=int)
         args.seed = get_user_input("Random Seed", default=50, value_type=int)
@@ -637,6 +658,13 @@ def main():
         if args.interactive:
             args = interactive_mode(args)
         
+        # Handle Clean Flag
+        if args.clean:
+            clean_results_directory()
+            # Reset flag so it doesn't clean again in a loop if we were to loop (though main loop re-parses args)
+            # But args is local.
+            pass
+        
         # Setup Logging
         logging.getLogger("rmsaenv").setLevel(logging.INFO if args.debug else logging.WARNING)
         np.set_printoptions(linewidth=np.inf)
@@ -685,6 +713,7 @@ def main():
             heuristic_idx = get_heuristic_index(args.heuristic)
 
             # Summary and Confirmation
+            clear_screen()
             print("\n" + "="*40)
             print("       SIMULATION CONFIGURATION       ")
             print("="*40)
@@ -729,9 +758,18 @@ def main():
 
             # Only run if confirmed (or yes flag)
             if args.yes or response in ('', 'y', 'yes'):
-                print(f"Running simulation for topology: {args.topology}")
-                print(f"Bands: {args.bands}")
-                print(f"Loads to simulate: {loads}")
+                clear_screen()
+                print("="*40)
+                print("       SIMULATION RUNNING...       ")
+                print("="*40)
+                print(f"{'Topology':<20}: {args.topology}")
+                print(f"{'Bands':<20}: {args.bands}")
+                print(f"{'Heuristic':<20}: {args.heuristic}")
+                print(f"{'Loads':<20}: {loads}")
+                print("-" * 40)
+                # print(f"Running simulation for topology: {args.topology}")
+                # print(f"Bands: {args.bands}")
+                # print(f"Loads to simulate: {loads}")
                 
                 # Determine number of workers
                 num_workers = args.workers
@@ -739,11 +777,27 @@ def main():
                     num_workers = cpu_count()
 
                 if num_workers > 1 and len(loads) > 1:
-                    print(f"\nRunning simulations in parallel with {num_workers} workers...")
+                    # print(f"\nRunning simulations in parallel with {num_workers} workers...")
                     
                     # Prepare arguments for each load
-                    load_args = [
-                        (
+                    load_args = []
+                    for idx, current_load in enumerate(loads):
+                        # Calculate position: 1-based index (0 is for total progress)
+                        # We want them to stack nicely.
+                        # If we have N workers, we can use positions 1 to N.
+                        # But since we use imap_unordered, tasks start as soon as a worker is free.
+                        # Ideally, we want a unique position for each *active* task.
+                        # However, mapping task index to position is simpler and works if N_tasks ~ N_workers.
+                        # If N_tasks >> N_workers, bars might overwrite or jump if we reuse positions blindly.
+                        # But reusing positions 1..N_workers is standard for pool.
+                        # Let's try assigning position based on idx % num_workers + 1
+                        # This way, if we have 12 workers, we use lines 1-12.
+                        # When worker 1 finishes task 1 and starts task 13, it reuses line 1.
+                        # This is cleaner than unique line for every single task (which would scroll off screen).
+                        
+                        pos = (idx % num_workers) + 1
+                        
+                        load_args.append((
                             args.episodes,
                             heuristic_idx,
                             topology,
@@ -759,21 +813,22 @@ def main():
                             args.defrag_services,
                             band_specs,
                             args.debug,
-                            args.max_span_length
-                        )
-                        for current_load in loads
-                    ]
+                            args.max_span_length,
+                            pos # Pass explicit position
+                        ))
                     
                     with Pool(processes=num_workers) as pool:
                         # Use imap_unordered with tqdm for progress tracking
+                        # Position 0 is for this total progress bar
                         list(tqdm(
                             pool.imap_unordered(run_single_load, load_args),
                             total=len(load_args),
                             desc="Total Progress",
-                            unit="load"
+                            unit="load",
+                            position=0
                         ))
                 else:
-                    print(f"\nRunning simulations sequentially...")
+                    # print(f"\nRunning simulations sequentially...")
                     for current_load in loads:
                         run_environment_with_monitoring(
                             n_eval_episodes=args.episodes,
@@ -799,6 +854,7 @@ def main():
 
         # Plotting Prompt
         if generate_plot and (args.interactive or not args.yes):
+            clear_screen()
             print("\n" + "="*40)
             print("           RESULTS PLOTTING           ")
             print("="*40)
@@ -814,34 +870,37 @@ def main():
                     should_plot = False
 
             if should_plot:
-                metrics_map = {
-                    "1": "episode_service_blocking_rate",
-                    "2": "episode_bit_rate_blocking_rate",
-                    "3": "mean_gsnr",
-                    "4": "episode_service_realocations"
-                }
+                # metrics_map = {
+                #     "1": "episode_service_blocking_rate",
+                #     "2": "episode_bit_rate_blocking_rate",
+                #     "3": "mean_gsnr",
+                #     "4": "episode_service_realocations"
+                # }
                 
-                selected_metrics = []
+                # selected_metrics = []
                 
-                if args.interactive:
-                    print("\nSelect Metric to Plot:")
-                    print("  1. Blocking Probability")
-                    print("  2. Bit Rate Blocking Rate")
-                    print("  3. Mean GSNR")
-                    print("  4. Service Reallocations")
-                    print("  5. All Metrics")
+                # if args.interactive:
+                #     print("\nSelect Metric to Plot:")
+                #     print("  1. Blocking Probability")
+                #     print("  2. Bit Rate Blocking Rate")
+                #     print("  3. Mean GSNR")
+                #     print("  4. Service Reallocations")
+                #     print("  5. All Metrics")
                     
-                    choice = input("Select an option (1-5): ").strip()
-                    if choice == "5":
-                        selected_metrics = list(metrics_map.values())
-                    elif choice in metrics_map:
-                        selected_metrics = [metrics_map[choice]]
-                    else:
-                        print("Invalid selection. Defaulting to Blocking Probability.")
-                        selected_metrics = ["episode_service_blocking_rate"]
-                else:
-                    # Non-interactive default
-                    selected_metrics = ["episode_service_blocking_rate"]
+                #     choice = input("Select an option (1-5): ").strip()
+                #     if choice == "5":
+                #         selected_metrics = list(metrics_map.values())
+                #     elif choice in metrics_map:
+                #         selected_metrics = [metrics_map[choice]]
+                #     else:
+                #         print("Invalid selection. Defaulting to Blocking Probability.")
+                #         selected_metrics = ["episode_service_blocking_rate"]
+                # else:
+                #     # Non-interactive default
+                #     selected_metrics = ["episode_service_blocking_rate"]
+                
+                # Default to Blocking Probability only as requested
+                selected_metrics = ["episode_service_blocking_rate"]
 
                 for metric in selected_metrics:
                     generate_plot(
