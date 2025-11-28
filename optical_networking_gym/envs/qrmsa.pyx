@@ -1288,7 +1288,7 @@ cdef class QRMSAEnv:
         
         # Mapear mod_idx_relative para modulation_idx real (índice 2 agora)
         if self.max_modulation_idx > 1:
-            allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - (self.modulations_to_consider - 1), -1))
+            allowed_mods = list(range(self.max_modulation_idx, self.max_modulation_idx - (self.modulations_to_consider), -1))
         else:
             allowed_mods = list(range(0, self.modulations_to_consider))
         

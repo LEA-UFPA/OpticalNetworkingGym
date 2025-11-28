@@ -107,7 +107,7 @@ def run_environment(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=5, 
-            modulations_to_consider=6,
+            modulations_to_consider=len(cur_modulations),
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
             gen_observation=gen_observation,
@@ -131,7 +131,7 @@ def run_environment(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=5, 
-            modulations_to_consider=6,
+            modulations_to_consider=len(cur_modulations),
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
             gen_observation=gen_observation,
@@ -350,13 +350,7 @@ def main():
     else:
         # Definição das modulações (valores atualizados conforme exemplo do launch power)
         cur_modulations: Tuple[Modulation, ...] = (
-            Modulation(
-                name="BPSK",
-                maximum_length=100_000,
-                spectral_efficiency=1,
-                minimum_osnr=3.71,
-                inband_xt=-14,
-            ),
+            # BPSK removido
             Modulation(
                 name="QPSK",
                 maximum_length=2_000,

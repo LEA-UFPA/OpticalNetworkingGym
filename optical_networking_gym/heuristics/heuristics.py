@@ -911,7 +911,9 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
         print("AVISO: Ambiente não tem bandas configuradas, usando heurística single-band")
         return heuristic_shortest_available_path_first_fit_best_modulation(env)
     
-    bands = sim_env.bands
+    # Iterar bandas preferindo menor atenuação (attenuation_normalized menor primeiro)
+    # Não altera ordem global em sim_env.bands, apenas cria uma lista ordenada localmente.
+    bands = sorted(sim_env.bands, key=lambda b: getattr(b, 'attenuation_normalized', float('inf')))
     
     for path_idx, path in enumerate(k_paths):
         for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
@@ -921,7 +923,16 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
             if required_slots <= 0:
                 continue 
             
-            for band_idx, band in enumerate(bands):
+            # Ao usar enumerate aqui, precisamos do índice original do band dentro de sim_env.bands
+            # porque get_multiband_action_index espera o índice da banda na lista do ambiente.
+            # Portanto, mapeamos cada banda ordenada para seu índice original.
+            for band in bands:
+                # Recuperar o índice original na lista do ambiente
+                try:
+                    band_idx = sim_env.bands.index(band)
+                except ValueError:
+                    # Fallback: se não encontrado (improvável), usar 0
+                    band_idx = 0
                 # Obter slots disponíveis do caminho
                 available_slots = sim_env.get_available_slots(path)
                 

@@ -16,7 +16,7 @@ class SimulationUtils:
     @staticmethod
     def define_modulations() -> Tuple[Modulation, ...]:
         return (
-            Modulation("BPSK", 100_000, 1, minimum_osnr=3.71, inband_xt=-14),
+            # BPSK removido
             Modulation("QPSK", 2_000,   2, minimum_osnr=6.72, inband_xt=-17),
             Modulation("8QAM",  1_000,   3, minimum_osnr=10.84, inband_xt=-20),
             Modulation("16QAM",   500,   4, minimum_osnr=13.24, inband_xt=-23),
