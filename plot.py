@@ -45,72 +45,122 @@ def gerar_grafico_probabilidade_bloqueio():
     # Define o limite superior para a filtragem.
     max_y_lim_filter = 1
 
-    # Loop principal para processar cada pasta de banda.
-    for idx, band_folder in enumerate(band_folders):
-        all_data = []
-        
-        full_band_path = os.path.join(base_results_dir, band_folder)
-        print(f"\nColetando dados para a pasta: '{full_band_path}'...")
-        
-        if not os.path.exists(full_band_path):
-            print(f"Aviso: Pasta '{full_band_path}' não encontrada. Pulando.")
-            continue
+    # Verificar se existem subpastas para bandas. Se existirem, manter comportamento anterior.
+    any_band_folder_exists = any(os.path.isdir(os.path.join(base_results_dir, bf)) for bf in band_folders)
+
+    if any_band_folder_exists:
+        # Loop principal para processar cada pasta de banda (comportamento antigo)
+        for idx, band_folder in enumerate(band_folders):
+            all_data = []
             
-        files = [f for f in os.listdir(full_band_path) if f.endswith(".csv")]
+            full_band_path = os.path.join(base_results_dir, band_folder)
+            print(f"\nColetando dados para a pasta: '{full_band_path}'...")
+            
+            if not os.path.exists(full_band_path):
+                print(f"Aviso: Pasta '{full_band_path}' não encontrada. Pulando.")
+                continue
+                
+            files = [f for f in os.listdir(full_band_path) if f.endswith(".csv")]
 
-        if not files:
-            print(f"ERRO: Nenhum ficheiro CSV encontrado na pasta '{band_folder}'.")
-            continue
+            if not files:
+                print(f"ERRO: Nenhum ficheiro CSV encontrado na pasta '{band_folder}'.")
+                continue
 
-        print(f"Arquivos encontrados em {band_folder}: {files}")
+            print(f"Arquivos encontrados em {band_folder}: {files}")
 
-        for f in files:
-            match = load_pattern.match(f)
-            if match:
-                load = int(match.group(1))
-                full_file_path = os.path.join(full_band_path, f)
-                try:
-                    data_load = pd.read_csv(full_file_path, skiprows=1)
+            for f in files:
+                match = load_pattern.match(f)
+                if match:
+                    load = int(match.group(1))
+                    full_file_path = os.path.join(full_band_path, f)
+                    try:
+                        data_load = pd.read_csv(full_file_path, skiprows=1)
 
-                    data_load = data_load[
-                        (data_load['episode_service_blocking_rate'] > 0) & 
-                        (data_load['episode_service_blocking_rate'] <= max_y_lim_filter)
-                    ]
-                    
-                    if not data_load.empty:
-                        data_load["load"] = load
-                        all_data.append(data_load)
+                        data_load = data_load[
+                            (data_load['episode_service_blocking_rate'] > 0) & 
+                            (data_load['episode_service_blocking_rate'] <= max_y_lim_filter)
+                        ]
                         
-                        if load > max_load:
-                            max_load = load
-                        if load < min_load:
-                            min_load = load
-                    else:
-                        print(f"Aviso: O ficheiro {f} contém apenas valores de bloqueio fora do intervalo desejado e será ignorado.")
+                        if not data_load.empty:
+                            data_load["load"] = load
+                            all_data.append(data_load)
+                            
+                            if load > max_load:
+                                max_load = load
+                            if load < min_load:
+                                min_load = load
+                        else:
+                            print(f"Aviso: O ficheiro {f} contém apenas valores de bloqueio fora do intervalo desejado e será ignorado.")
 
-                except Exception as e:
-                    print(f"Aviso: Não foi possível ler ou processar o ficheiro {full_file_path}. Erro: {e}")
-            else:
-                print(f"Aviso: Nome de arquivo não corresponde ao padrão esperado: {f}")
+                    except Exception as e:
+                        print(f"Aviso: Não foi possível ler ou processar o ficheiro {full_file_path}. Erro: {e}")
+                else:
+                    print(f"Aviso: Nome de arquivo não corresponde ao padrão esperado: {f}")
 
-        if not all_data:
-            print(f"ERRO: Nenhum dado válido foi carregado em '{band_folder}'.")
-            continue
+            if not all_data:
+                print(f"ERRO: Nenhum dado válido foi carregado em '{band_folder}'.")
+                continue
 
-        data_loads = pd.concat(all_data, axis=0, ignore_index=True)
-        print(f"Dados carregados para '{band_folder}': cargas {sorted(data_loads['load'].unique())}")
+            data_loads = pd.concat(all_data, axis=0, ignore_index=True)
+            print(f"Dados carregados para '{band_folder}': cargas {sorted(data_loads['load'].unique())}")
 
-        mean_blocking_rate = data_loads.groupby("load").mean()["episode_service_blocking_rate"]
+            mean_blocking_rate = data_loads.groupby("load").mean()["episode_service_blocking_rate"]
 
-        plt.plot(
-            mean_blocking_rate.index,
-            mean_blocking_rate.values,
-            label=f"{band_folder}",
-            marker=markers[idx],
-            markersize=6,
-            linewidth=1,
-            mec="black",
-        )
+            plt.plot(
+                mean_blocking_rate.index,
+                mean_blocking_rate.values,
+                label=f"{band_folder}",
+                marker=markers[idx],
+                markersize=6,
+                linewidth=1,
+                mec="black",
+            )
+    else:
+        # Caso sem subpastas: procurar CSVs diretamente em results/ (ex.: load_results_nobel-eu_600.csv)
+        print("Nenhuma pasta de banda encontrada em 'results/'. Lendo CSVs diretamente de 'results/'.")
+        files = [f for f in os.listdir(base_results_dir) if f.endswith('.csv')]
+        if not files:
+            print(f"ERRO: Nenhum CSV encontrado em '{base_results_dir}'. Saindo.")
+        else:
+            # agrupar por carga e calcular média
+            all_data = []
+            for f in files:
+                match = load_pattern.match(f)
+                if match:
+                    load = int(match.group(1))
+                    full_file_path = os.path.join(base_results_dir, f)
+                    try:
+                        data_load = pd.read_csv(full_file_path, skiprows=1)
+                        data_load = data_load[
+                            (data_load['episode_service_blocking_rate'] > 0) &
+                            (data_load['episode_service_blocking_rate'] <= max_y_lim_filter)
+                        ]
+                        if not data_load.empty:
+                            data_load['load'] = load
+                            all_data.append(data_load)
+                            if load > max_load:
+                                max_load = load
+                            if load < min_load:
+                                min_load = load
+                        else:
+                            print(f"Aviso: O ficheiro {f} contém apenas valores de bloqueio fora do intervalo desejado e será ignorado.")
+                    except Exception as e:
+                        print(f"Aviso: Não foi possível ler {full_file_path}: {e}")
+                else:
+                    print(f"Aviso: Nome de arquivo não corresponde ao padrão esperado: {f}")
+
+            if all_data:
+                data_loads = pd.concat(all_data, axis=0, ignore_index=True)
+                mean_blocking_rate = data_loads.groupby('load').mean()['episode_service_blocking_rate']
+                plt.plot(
+                    mean_blocking_rate.index,
+                    mean_blocking_rate.values,
+                    label=f"{topology_name} (single-folder)",
+                    marker='o',
+                    markersize=6,
+                    linewidth=1,
+                    mec='black'
+                )
 
     # CONFIGURAÇAO DO GRAFICO
 
