@@ -6,6 +6,7 @@ from optical_networking_gym.utils import rle, link_shannon_entropy_, fragmentati
 from optical_networking_gym.core.osnr import calculate_osnr
 from optical_networking_gym.envs.qrmsa import QRMSAEnv
 from gymnasium import Env
+import pyswarms as ps
 
 from gymnasium import Env
 from optical_networking_gym.envs.qrmsa import QRMSAEnv
@@ -1013,3 +1014,212 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                     blocked_due_to_osnr = True
     
     return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
+
+
+
+def shortest_path_best_modulation_best_band_particle_swarm_optimization(env: Env) -> tuple[int, bool, bool]:
+    """
+    Heurística que utiliza Particle Swarm Optimization (PSO) para selecionar a melhor
+    alocação de recursos em uma rede óptica com múltiplas bandas.
+    """
+    sim_env = get_qrmsa_env(env)
+    source = sim_env.current_service.source
+    destination = sim_env.current_service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+
+    # Verificar se o ambiente tem bandas
+    if not hasattr(sim_env, 'bands') or not sim_env.bands:
+        print("AVISO: Ambiente não tem bandas configuradas, usando heurística single-band")
+        return heuristic_shortest_available_path_first_fit_best_modulation(env)
+
+    # Definir função objetivo para PSO
+    def objective_function(x):
+        fitness = []
+        for particle in x:
+            path_idx = int(particle[0])
+            band_idx = int(particle[1])
+            modulation_idx = int(particle[2])
+            slot_start = int(particle[3])
+
+            path = k_paths[path_idx]
+            band = sim_env.bands[band_idx]
+            modulation = sim_env.modulations[modulation_idx]
+            required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+
+            available_slots = sim_env.get_available_slots(path)
+            valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+
+            if slot_start not in valid_starts:
+                fitness.append(1e6)  # Penalidade alta para soluções inválidas
+                continue
+
+            service = sim_env.current_service
+            service.path = path
+            service.initial_slot = slot_start
+            service.number_slots = required_slots
+            service.current_modulation = modulation
+            service.current_band = band
+            service.center_frequency = band.center_frequency_hz_from_global(slot_start, required_slots)
+            service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+            service.launch_power = sim_env.launch_power
+
+            osnr, _, _ = calculate_osnr(sim_env, service)
+            threshold = modulation.minimum_osnr + sim_env.margin
+
+            if osnr >= threshold:
+                fitness.append(0)  # Boa solução
+            else:
+                fitness.append(1e5)  # Penalidade para baixa OSNR
+
+        return np.array(fitness)
+
+    # Configurar PSO
+    num_particles = 30
+    dimensions = 4  # path_idx, band_idx, modulation_idx, slot_start
+    options = {'c1': 0.5, 'c2': 0.3, 'w': 0.9}
+
+    # Construir limites para partículas (inteiros convertidos em float para o otimizador)
+    n_paths = len(k_paths)
+    n_bands = len(sim_env.bands)
+    n_mods = len(sim_env.modulations)
+    slots_total = sim_env.num_spectrum_resources
+
+    # lower and upper bounds for each dimension
+    lb = [0, 0, 0, 0]
+    ub = [max(0, n_paths - 1), max(0, n_bands - 1), max(0, n_mods - 1), max(0, slots_total - 1)]
+
+    bounds = (np.array(lb, dtype=float), np.array(ub, dtype=float))
+
+    # Função objetivo que implementa as fórmulas pedidas:
+    # fragmentacao = 0.4*shannon + 0.3*cuts + 0.3*RSS
+    # ATT = média de attenuation_normalized ao longo dos spans da rota e banda (usamos band.attenuation_normalized)
+    # slots = tamanho_do_bloco + numero_de_slots_disponiveis
+    # obj = 0.3*fragmentacao + 0.4*ATT + 0.3*Nslots
+    def objective_fragmentation(x):
+        """Recebe matriz (n_particles, dimensions) e retorna vetor de fitness (n_particles,).
+
+        Menor fitness = melhor solução.
+        """
+        fitness = []
+        for particle in x:
+            try:
+                path_idx = int(np.clip(np.round(particle[0]), 0, n_paths - 1))
+                band_idx = int(np.clip(np.round(particle[1]), 0, n_bands - 1))
+                modulation_idx = int(np.clip(np.round(particle[2]), 0, n_mods - 1))
+                slot_start = int(np.clip(np.round(particle[3]), 0, slots_total - 1))
+
+                path = k_paths[path_idx]
+                band = sim_env.bands[band_idx]
+                modulation = sim_env.modulations[modulation_idx]
+
+                required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+
+                # checar candidatos dentro da banda
+                available_slots = sim_env.get_available_slots(path)
+                valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+
+                if slot_start not in valid_starts:
+                    # penalidade alta para soluções inválidas
+                    fitness.append(1e6)
+                    continue
+
+                # calcular fragmentação usando utilitários
+                # shannon: entropia por link/rota
+                try:
+                    shannon = link_shannon_entropy_(available_slots)
+                except Exception:
+                    # fallback: usar entropia simples baseada em proporção de ocupação
+                    occupancy = 1.0 - (np.sum(available_slots) / len(available_slots))
+                    shannon = occupancy
+
+                try:
+                    cuts = fragmentation_route_cuts(available_slots)
+                except Exception:
+                    cuts = float(np.sum(np.abs(np.diff(available_slots))))
+
+                try:
+                    rss = fragmentation_route_rss(available_slots)
+                except Exception:
+                    rss = float(np.sum(available_slots))
+
+                fragmentacao = 0.4 * shannon + 0.3 * cuts + 0.3 * rss
+
+                # ATT: usamos a atenuacao da banda como proxy; também incorporamos distância média da rota
+                try:
+                    att_band = getattr(band, 'attenuation_normalized', 0.0)
+                except Exception:
+                    att_band = 0.0
+
+                # slots metric: bloco disponível (tamanho do bloco encontrado) + numero de slots livres totais na rota
+                initial_indices, values, lengths = rle(available_slots)
+                # identificar bloco que contém slot_start (global index)
+                block_size = 0
+                for idx_i, start_idx in enumerate(initial_indices):
+                    if values[idx_i] == 1:
+                        s = start_idx
+                        e = start_idx + lengths[idx_i]
+                        if s <= slot_start < e:
+                            block_size = lengths[idx_i]
+                            break
+
+                n_slots_free = int(np.sum(available_slots))
+                slots_metric = float(block_size + n_slots_free)
+
+                # normalizar componentes para escalas semelhantes
+                # fragmentacao assumida entre 0..1 (se funções retornarem maiores, escalonar)
+                frag_norm = float(fragmentacao)
+                att_norm = float(att_band)  # já em 1/m pequeno; ponderar diretamente
+                slots_norm = slots_metric / max(1.0, slots_total)
+
+                obj = 0.3 * frag_norm + 0.4 * att_norm + 0.3 * slots_norm
+
+                fitness.append(obj)
+            except Exception as e:
+                # penalidade por erro
+                fitness.append(1e6)
+
+        return np.array(fitness)
+
+    # executar PSO (Global Best)
+    try:
+        optimizer = ps.single.GlobalBestPSO(n_particles=num_particles, dimensions=dimensions, options=options, bounds=bounds)
+        best_cost, best_pos = optimizer.optimize(objective_fragmentation, iters=50, verbose=False)
+    except Exception as e:
+        # Falha em executar PSO: fallback para heurística simples
+        print(f"PSO falhou: {e}, usando heurística fallback")
+        return shortest_available_path_first_fit_best_modulation_best_band(env)
+
+    # converter best_pos para índices inteiros
+    best_path = int(np.clip(np.round(best_pos[0]), 0, n_paths - 1))
+    best_band = int(np.clip(np.round(best_pos[1]), 0, n_bands - 1))
+    best_mod = int(np.clip(np.round(best_pos[2]), 0, n_mods - 1))
+    best_slot = int(np.clip(np.round(best_pos[3]), 0, slots_total - 1))
+
+    # validar e calcular action index
+    path = k_paths[best_path]
+    band = sim_env.bands[best_band]
+    modulation = sim_env.modulations[best_mod]
+    required_slots = sim_env.get_number_slots(sim_env.current_service, modulation)
+    available_slots = sim_env.get_available_slots(path)
+    valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+
+    if best_slot not in valid_starts:
+        # escolher primeiro candidato válido como fallback
+        if len(valid_starts) == 0:
+            return env.action_space.n - 1, True, False
+        best_slot = int(valid_starts[0])
+
+    # mapear slot global -> slot in band
+    slot_in_band = best_slot - band.slot_start
+    try:
+        action_index = get_multiband_action_index(sim_env, best_path, best_band, best_mod, slot_in_band)
+    except Exception:
+        return env.action_space.n - 1, True, False
+
+    if action_index >= sim_env.action_space.n:
+        return env.action_space.n - 1, True, False
+
+    return int(action_index), False, False
+
+# manter compatibilidade de nome exportando alias
+pso_fragmentation_band_aware = shortest_path_best_modulation_best_band_particle_swarm_optimization
