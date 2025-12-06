@@ -78,28 +78,31 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     Returns:
         int: Índice da ação correspondente.
     """
-    # Converter o índice absoluto da modulação para o relativo
-    relative_modulation_index = env.max_modulation_idx - modulation_index
-    
-    # CORREÇÃO CRÍTICA: O ambiente assume que todas as bandas têm o mesmo número de slots
-    # Para o cálculo da ação. Verificar se é realmente o caso ou usar o valor da primeira banda.
-    # Baseado no código do ambiente (line 1166 e 1363 em qrmsa.pyx):
+    # Ambiente decodifica ações multibanda usando slots_per_band (primeira banda) e
+    # modulação relativa (allowed_mods). Precisamos gerar o mesmo índice.
     slots_per_band = env.bands[0].num_slots if env.bands else env.num_spectrum_resources
-    
-    # IMPORTANTE: O ambiente decodifica assumindo slots_per_band uniformes, então precisamos
-    # usar o mesmo valor aqui. Se a banda atual tem um número diferente de slots,
-    # precisamos validar se slot_in_band está dentro do range da primeira banda.
-    if slot_in_band >= slots_per_band:
-        raise ValueError(f"slot_in_band {slot_in_band} excede slots_per_band {slots_per_band} "
-                        f"para banda {band_index}. O ambiente assume bandas uniformes.")
-    
-    # Fórmula baseada na estrutura do action space:
+    if slot_in_band < 0 or slot_in_band >= slots_per_band:
+        raise ValueError(
+            f"slot_in_band {slot_in_band} fora do intervalo 0..{slots_per_band-1} para banda {band_index}"
+        )
+
+    # Mapeia modulação absoluta para índice relativo usado no espaço de ações
+    if env.max_modulation_idx > 1:
+        allowed_mods = list(range(env.max_modulation_idx, env.max_modulation_idx - env.modulations_to_consider, -1))
+    else:
+        allowed_mods = list(range(0, env.modulations_to_consider))
+
+    try:
+        modulation_relative = allowed_mods.index(modulation_index)
+    except ValueError:
+        raise ValueError(f"Modulação {modulation_index} não está em allowed_mods {allowed_mods}")
+
     # action_space_size = (k_paths * num_bands * modulations_to_consider * slots_per_band) + 1
-    action_index = (path_index * env.num_bands * env.modulations_to_consider * slots_per_band +
-                   band_index * env.modulations_to_consider * slots_per_band +
-                   relative_modulation_index * slots_per_band +
-                   slot_in_band)
-    
+    action_index = (
+        ((path_index * env.num_bands + band_index) * env.modulations_to_consider + modulation_relative)
+        * slots_per_band
+        + slot_in_band
+    )
     return action_index
 
 # def decimal_to_array(env: QRMSAEnv, decimal: int, max_values: list[int] = None) -> list[int]:
@@ -1123,6 +1126,23 @@ def shortest_path_best_modulation_best_band_particle_swarm_optimization(env: Env
                     fitness.append(1e6)
                     continue
 
+                # Verificar QoT (OSNR) antes de calcular métrica
+                service = sim_env.current_service
+                service.path = path
+                service.initial_slot = slot_start
+                service.number_slots = required_slots
+                service.current_modulation = modulation
+                service.current_band = band
+                service.center_frequency = band.center_frequency_hz_from_global(slot_start, required_slots)
+                service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+                service.launch_power = sim_env.launch_power
+
+                osnr, _, _ = calculate_osnr(sim_env, service)
+                threshold = modulation.minimum_osnr + sim_env.margin
+                if osnr < threshold:
+                    fitness.append(1e5)
+                    continue
+
                 # calcular fragmentação usando utilitários
                 # shannon: entropia por link/rota
                 try:
@@ -1189,7 +1209,7 @@ def shortest_path_best_modulation_best_band_particle_swarm_optimization(env: Env
         print(f"PSO falhou: {e}, usando heurística fallback")
         return shortest_available_path_first_fit_best_modulation_best_band(env)
 
-    # converter best_pos para índices inteiros
+    # converter best_pos para índices inteiros dentro dos limites
     best_path = int(np.clip(np.round(best_pos[0]), 0, n_paths - 1))
     best_band = int(np.clip(np.round(best_pos[1]), 0, n_bands - 1))
     best_mod = int(np.clip(np.round(best_pos[2]), 0, n_mods - 1))
@@ -1211,7 +1231,41 @@ def shortest_path_best_modulation_best_band_particle_swarm_optimization(env: Env
 
     # mapear slot global -> slot in band
     slot_in_band = best_slot - band.slot_start
+    slots_per_band = sim_env.bands[0].num_slots
+    if slot_in_band < 0 or slot_in_band >= slots_per_band:
+        return env.action_space.n - 1, True, False
+
+    # validar QoT antes de retornar ação
+    service = sim_env.current_service
+    service.path = path
+    service.initial_slot = best_slot
+    service.number_slots = required_slots
+    service.current_modulation = modulation
+    service.current_band = band
     try:
+        service.center_frequency = band.center_frequency_hz_from_global(best_slot, required_slots)
+    except Exception:
+        service.center_frequency = (
+            sim_env.frequency_start
+            + (sim_env.frequency_slot_bandwidth * best_slot)
+            + (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+        )
+    service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+    service.launch_power = sim_env.launch_power
+
+    osnr, _, _ = calculate_osnr(sim_env, service)
+    if osnr < modulation.minimum_osnr + sim_env.margin:
+        return env.action_space.n - 1, True, False
+
+    try:
+        # Garantir que a modulação usada pertence ao conjunto allowed_mods do ambiente
+        if sim_env.max_modulation_idx > 1:
+            allowed_mods = list(range(sim_env.max_modulation_idx, sim_env.max_modulation_idx - sim_env.modulations_to_consider, -1))
+        else:
+            allowed_mods = list(range(0, sim_env.modulations_to_consider))
+        if best_mod not in allowed_mods:
+            best_mod = allowed_mods[-1]
+
         action_index = get_multiband_action_index(sim_env, best_path, best_band, best_mod, slot_in_band)
     except Exception:
         return env.action_space.n - 1, True, False
