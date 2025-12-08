@@ -10,10 +10,8 @@ from optical_networking_gym.envs.qrmsa import QRMSAEnv
 from optical_networking_gym.utils import rle
 
 from optical_networking_gym.heuristics.heuristics import (
-    shortest_available_path_first_fit_best_modulation,
-    shortest_available_path_lowest_spectrum_best_modulation,
-    best_modulation_load_balancing,
-    load_balancing_best_modulation,
+    shortest_available_path_first_fit_best_modulation_best_band,
+    heuristic_shortest_available_path_first_fit_best_modulation
 )
 
 register(

@@ -17,16 +17,8 @@ from tqdm import tqdm
 from optical_networking_gym.topology import Modulation, get_topology
 from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
 from optical_networking_gym.heuristics.heuristics import (
-    shortest_available_path_first_fit_best_modulation,
-    shortest_available_path_lowest_spectrum_best_modulation,
-    best_modulation_load_balancing,
-    load_balancing_best_modulation,
-    rnd,
-    heuristic_shortest_available_path_first_fit_best_modulation,
-    heuristic_highest_snr,
-    heuristic_lowest_fragmentation,
-    heuristic_priority_band_C_then_L,
     shortest_available_path_first_fit_best_modulation_best_band,
+    heuristic_shortest_available_path_first_fit_best_modulation
 )
 
 # ===================================================
@@ -50,16 +42,8 @@ def get_loads(topology_name: str) -> np.ndarray:
 def get_heuristic_function(heuristic_index: int):
     """Retorna a função heurística baseada no índice"""
     if heuristic_index == 1:
-        return heuristic_shortest_available_path_first_fit_best_modulation
+        return shortest_available_path_first_fit_best_modulation_best_band
     elif heuristic_index == 2:
-        return heuristic_highest_snr
-    elif heuristic_index == 3:
-        return heuristic_lowest_fragmentation
-    elif heuristic_index == 4:
-        return load_balancing_best_modulation
-    elif heuristic_index == 5:
-        return heuristic_priority_band_C_then_L
-    elif heuristic_index == 6:
         return shortest_available_path_first_fit_best_modulation_best_band
     else:
         raise ValueError(f"Heuristic index `{heuristic_index}` is not found!")
@@ -281,13 +265,28 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=Tr
         default_noise_figure=4.5, 
         k_paths=2  # Reduzido para compatibilidade com redes menores
     )
-    
+
     # Configuração de banda multibanda baseada no graph_load.py
-    band_specs = [
-        {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.20},
-        {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-        {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.22},
-    ]
+    band_specs = {
+        "BandaC": [
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191}
+        ],
+        "BandaL": [
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200}
+        ],
+        "BandaS": [
+            {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220}
+        ],
+        "BandaC+L": [
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191}
+        ],
+        "BandaC+L+S": [
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
+            {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220}
+        ]
+    }
     
     # Configurações do ambiente usando band_specs (padrão do graph_load.py)
     env_args = dict(
@@ -340,14 +339,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-hi', '--heuristic_index',
         type=int,
-        default=6,
-        choices=[1, 2, 3, 4, 5, 6],
-        help='Índice da heurística (1: First Fit, 2: Highest SNR, 3: Lowest Fragmentation, 4: Load Balancing, 5: Prioridade Banda C então L, 6: Multibanda Best Band)'
+        default=1,
+        choices=[1,2],
+        help='Índice da heurística (1: First fit, 2: shortest_available_path_first_fit_best_modulation_best_band)'
     )
 
     parser.add_argument('-mb', '--bands', nargs='+', type=str, 
-                        default=['BandaC+L'],
-                        choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L'],
+                        default=['BandaC+L+S'],
+                        choices=['BandaC', 'BandaL', 'BandaS', 'BandaC+L', 'BandaC+L+S'],
                         help='Especifica uma ou mais bandas para simular')
     parser.add_argument(
         '-d', '--debug',
@@ -383,32 +382,27 @@ def main():
         raise FileNotFoundError(f"Arquivo de topologia '{topology_path}' não encontrado.")
 
     # Configurações de banda com slots uniformes
-    if args.topology_file == "nobel-eu.xml":
-        band_specs_options = {
-            "BandaC": [{"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191}],
-            "BandaL": [{"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200}],
-            "BandaS": [{"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220}],
-            "BandaC+L": [
-                {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
-                {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
-            ]
-        }
-    else:
-        band_specs_options = {
-            "BandaC": [{"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191}],
-            "BandaL": [{"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200}],
-            "BandaS": [{"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220}],
-            "BandaC+L": [
-                {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191},
-                {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200},
-            ]
-        }
+    
+    band_specs_all = {
+        "BandaC": [{"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 5.5, "attenuation_db_km": 0.191}],
+        "BandaL": [{"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 6.0, "attenuation_db_km": 0.200}],
+        "BandaS": [{"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220}],
+        "BandaC+L": [   
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
+        ],
+        "BandaC+L+S": [
+            {"name": "L", "start_thz": 185.83, "num_slots": 406, "noise_figure_db": 5.5, "attenuation_db_km": 0.200},
+            {"name": "C", "start_thz": 191.60, "num_slots": 344, "noise_figure_db": 6.0, "attenuation_db_km": 0.191},
+            {"name": "S", "start_thz": 197.22, "num_slots": 647, "noise_figure_db": 7.0, "attenuation_db_km": 0.220},
+        ]
+    }
 
     # Obter as cargas baseadas na topologia
     loads = get_loads(args.topology_file)
 
     for band_name in args.bands:
-        band_specs = band_specs_options[band_name]
+        band_specs = band_specs_all[band_name]
         
         # Criar topologia
         topology = get_topology(
