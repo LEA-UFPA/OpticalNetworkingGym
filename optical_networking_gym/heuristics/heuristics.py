@@ -1,7 +1,16 @@
 import numpy as np
+import math
+from typing import Optional
+from optical_networking_gym.utils import rle, link_shannon_entropy_, fragmentation_route_cuts, fragmentation_route_rss
 from optical_networking_gym.core.osnr import calculate_osnr
 from optical_networking_gym.envs.qrmsa import QRMSAEnv
 from gymnasium import Env
+
+try:
+    import pyswarms as ps
+    HAS_PYSWARMS = True
+except ImportError:
+    HAS_PYSWARMS = False
 
 def get_qrmsa_env(env: Env) -> QRMSAEnv:
     """
@@ -281,3 +290,234 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                     blocked_due_to_osnr = True
     
     return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
+
+
+def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
+    """
+    Heurística PSO para seleção de banda e caminho em ambiente multiband.
+    
+    Usa Particle Swarm Optimization para encontrar a melhor combinação (rota, banda),
+    considerando atenuação, utilização de slots e fragmentação.
+    Após encontrar a melhor (rota, banda), usa first-fit para escolher modulação e slots.
+    
+    Args:
+        env: Ambiente Gym (potencialmente wrapped).
+        
+    Returns:
+        tuple[int, bool, bool]: (action_index, blocked_resources, blocked_osnr)
+    """
+    if not HAS_PYSWARMS:
+        # Fallback para heurística padrão se PySwarms não estiver instalado
+        print("AVISO: PySwarms não está instalado, usando heurística padrão")
+        return shortest_available_path_first_fit_best_modulation_best_band(env)
+    
+    # Resolve o QRMSA base e garanta fallback se o ambiente não tiver bandas configuradas
+    sim_env = get_qrmsa_env(env)
+    if not hasattr(sim_env, "bands") or not sim_env.bands:
+        return heuristic_shortest_available_path_first_fit_best_modulation(env)
+    
+    service = sim_env.current_service
+    source = service.source
+    destination = service.destination
+    k_paths = sim_env.k_shortest_paths[source, destination]
+    num_paths = min(len(k_paths), sim_env.k_paths)
+    num_bands = len(sim_env.bands)
+
+    if num_paths == 0 or num_bands == 0:
+        return env.action_space.n - 1, True, False
+
+    # Tamanho da demanda de referência vem da maior modulação permitida no instante
+    ref_mod_idx = sim_env.max_modulation_idx if sim_env.max_modulation_idx >= 0 else 0
+    ref_mod_idx = min(ref_mod_idx, len(sim_env.modulations) - 1)
+    ref_modulation = sim_env.modulations[ref_mod_idx]
+    ref_slots = max(1, sim_env.get_number_slots(service, ref_modulation))
+    penalty = 1e6
+
+    def clamp_indices(p_idx: float, b_idx: float) -> tuple[int, int]:
+        path_idx = int(np.clip(round(p_idx), 0, num_paths - 1))
+        band_idx = int(np.clip(round(b_idx), 0, num_bands - 1))
+        return path_idx, band_idx
+
+    def allocation_metric(band_available: np.ndarray) -> float:
+        # Combina taxa de utilização e maior bloco contíguo para medir pressão de alocação
+        if band_available.size == 0:
+            return 1.0
+        free_ratio = np.sum(band_available) / band_available.size
+        largest_block = 0
+        initial_indices, values, lengths = rle(band_available)
+        if values is not None:
+            free_blocks = lengths[values == 1]
+            if free_blocks.size > 0:
+                largest_block = int(np.max(free_blocks))
+        term1 = 1.0 - free_ratio
+        term2 = min(1.0, ref_slots / max(largest_block, 1))
+        return 0.6 * term1 + 0.4 * term2
+
+    def fragmentation_metric(path_idx: int, band) -> float:
+        # Avalia fragmentação da banda recortando o espectro do caminho e usando as métricas do QRMSA
+        raw = sim_env._get_spectrum_slots(path_idx)
+        if isinstance(raw, list):
+            spectrum = [np.array(row) for row in raw]
+        else:
+            arr = np.array(raw)
+            if arr.ndim == 1:
+                spectrum = [arr]
+            elif arr.ndim == 2:
+                spectrum = [arr[i, :] for i in range(arr.shape[0])]
+            else:
+                return penalty
+        band_spectrum = [row[band.slot_start:band.slot_end] for row in spectrum if row.size > 0]
+        if not band_spectrum:
+            return penalty
+        entropies = [link_shannon_entropy_(row.tolist()) for row in band_spectrum]
+        shannon = sum(entropies) / len(entropies) if entropies else 0.0
+        cuts = fragmentation_route_cuts([row.tolist() for row in band_spectrum])
+        rss = fragmentation_route_rss([row.tolist() for row in band_spectrum])
+        return 0.4 * shannon + 0.3 * cuts + 0.3 * rss
+
+    def evaluate_pair(path_idx: int, band_idx: int) -> float:
+        try:
+            path = k_paths[path_idx]
+            band = sim_env.bands[band_idx]
+            available_slots = sim_env.get_available_slots(path)
+            if available_slots is None:
+                return penalty
+            band_slice = np.array(available_slots[band.slot_start:band.slot_end])
+            try:
+                candidates = sim_env._get_candidates_in_band(available_slots, ref_slots, band)
+            except Exception:
+                return penalty
+            if not candidates:
+                return penalty
+            attenuation = getattr(band, "attenuation_normalized", 1.0)
+            # Normaliza atenuação pela pior (maior) banda disponível para manter 0..1
+            max_att = max(getattr(b, "attenuation_normalized", 1.0) for b in sim_env.bands) or 1.0
+            attenuation_norm = min(1.0, attenuation / max_att) if attenuation >= 0 else 1.0
+
+            allocation = allocation_metric(band_slice)  # já 0..1 pela construção
+
+            # Fragmentação pode crescer; usa transformação saturante para 0..1
+            fragmentation_raw = max(0.0, fragmentation_metric(path_idx, band))
+            fragmentation_norm = fragmentation_raw / (1.0 + fragmentation_raw)
+
+            result = 0.1560 * attenuation_norm + 0.0581 * allocation + 0.8662 * fragmentation_norm
+            
+            # Garantir que o resultado é finito
+            if not np.isfinite(result):
+                return penalty
+            
+            return result
+        except Exception:
+            return penalty
+
+    def pso_objective(x: np.ndarray) -> np.ndarray:
+        # Pontua cada partícula convertendo (path, band) em score composto
+        scores = np.zeros(x.shape[0], dtype=float)
+        for idx, particle in enumerate(x):
+            path_idx, band_idx = clamp_indices(particle[0], particle[1])
+            score = evaluate_pair(path_idx, band_idx)
+            # Garantir que score é finito
+            if not np.isfinite(score):
+                score = penalty
+            scores[idx] = score
+        return scores
+
+    if num_paths * num_bands == 1:
+        best_path_idx, best_band_idx = 0, 0
+    else:
+        # Executa o PSO apenas sobre (rota, banda); o restante fica com o first-fit padrão
+        options = {'c1': 0.8116, 'c2': 1.9064, 'w': 0.9856}
+        particles = max(5, min(32, num_paths * num_bands))
+        bounds = (np.zeros(2), np.array([num_paths - 1, num_bands - 1], dtype=float))
+        optimizer = ps.single.GlobalBestPSO(
+            n_particles=particles,
+            dimensions=2,
+            options=options,
+            bounds=bounds,
+        )
+        try:
+            _, pos = optimizer.optimize(pso_objective, iters=24, verbose=False)
+            # Garantir que pos não contém NaN
+            if not np.all(np.isfinite(pos)):
+                best_path_idx, best_band_idx = 0, 0
+            else:
+                best_path_idx, best_band_idx = clamp_indices(pos[0], pos[1])
+        except Exception:
+            # Se PSO falhar, usar valores padrão
+            best_path_idx, best_band_idx = 0, 0
+
+    def allocate_with_first_fit(path_idx: int, band_idx: int) -> tuple[Optional[int], bool, bool]:
+        # Depois da escolha via PSO, caia no fluxo first-fit existente para modularização e slots
+        blocked_resources = False
+        blocked_osnr = False
+        path = k_paths[path_idx]
+        band = sim_env.bands[band_idx]
+        available_slots = sim_env.get_available_slots(path)
+
+        for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
+            modulation = sim_env.modulations[modulation_idx]
+            required_slots = sim_env.get_number_slots(service, modulation)
+            if required_slots <= 0:
+                continue
+
+            try:
+                valid_starts = sim_env._get_candidates_in_band(available_slots, required_slots, band)
+            except Exception:
+                blocked_resources = True
+                continue
+
+            if not valid_starts:
+                blocked_resources = True
+                continue
+
+            global_candidate_start = valid_starts[0]
+            slot_in_band = global_candidate_start - band.slot_start
+            if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+                continue
+
+            candidate_service = service
+            candidate_service.path = path
+            candidate_service.initial_slot = global_candidate_start
+            candidate_service.number_slots = required_slots
+            candidate_service.current_modulation = modulation
+            candidate_service.current_band = band
+
+            try:
+                candidate_service.center_frequency = band.center_frequency_hz_from_global(
+                    global_candidate_start, required_slots
+                )
+            except Exception:
+                candidate_service.center_frequency = (
+                    sim_env.frequency_start +
+                    (sim_env.frequency_slot_bandwidth * global_candidate_start) +
+                    (sim_env.frequency_slot_bandwidth * (required_slots / 2))
+                )
+
+            candidate_service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
+            candidate_service.launch_power = sim_env.launch_power
+
+            try:
+                osnr, _, _ = calculate_osnr(sim_env, candidate_service)
+            except Exception:
+                blocked_osnr = True
+                continue
+
+            threshold = modulation.minimum_osnr + sim_env.margin
+            if osnr >= threshold:
+                action_index = get_multiband_action_index(
+                    sim_env, path_idx, band_idx, modulation_idx, slot_in_band
+                )
+                if action_index < sim_env.action_space.n:
+                    return action_index, False, False
+            else:
+                blocked_osnr = True
+                if blocked_resources:
+                    blocked_resources = False
+
+        return None, blocked_resources, blocked_osnr
+
+    action_index, blocked_resources, blocked_osnr = allocate_with_first_fit(best_path_idx, best_band_idx)
+    if action_index is not None:
+        return action_index, blocked_resources, blocked_osnr
+
+    return shortest_available_path_first_fit_best_modulation_best_band(env)

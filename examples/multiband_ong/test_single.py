@@ -18,7 +18,8 @@ from optical_networking_gym.topology import Modulation, get_topology
 from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
 from optical_networking_gym.heuristics.heuristics import (
     shortest_available_path_first_fit_best_modulation_best_band,
-    heuristic_shortest_available_path_first_fit_best_modulation
+    heuristic_shortest_available_path_first_fit_best_modulation,
+    get_best_band_path_pso
 )
 
 # ===================================================
@@ -27,7 +28,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(600, 1401, 100)  # Usando valores seguros do graph_load.py
+        return np.arange(700, 2401, 100)  # Usando valores seguros do graph_load.py
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -45,6 +46,8 @@ def get_heuristic_function(heuristic_index: int):
         return shortest_available_path_first_fit_best_modulation_best_band
     elif heuristic_index == 2:
         return shortest_available_path_first_fit_best_modulation_best_band
+    elif heuristic_index == 3:
+        return get_best_band_path_pso
     else:
         raise ValueError(f"Heuristic index `{heuristic_index}` is not found!")
 
@@ -334,14 +337,14 @@ def parse_arguments() -> argparse.Namespace:
         '-s', '--episode_length',
         type=int,
         default=100000,
-        help='Número de chegadas por episódio (default: 100000)'
+        help='Número de chegadas por episódio (default: 100)'
     )
     parser.add_argument(
         '-hi', '--heuristic_index',
         type=int,
         default=1,
-        choices=[1,2],
-        help='Índice da heurística (1: First fit, 2: shortest_available_path_first_fit_best_modulation_best_band)'
+        choices=[1,2,3],
+        help='Índice da heurística (1: First fit, 2: shortest_available_path_first_fit_best_modulation_best_band, 3: get_best_band_path_pso)'
     )
 
     parser.add_argument('-mb', '--bands', nargs='+', type=str, 

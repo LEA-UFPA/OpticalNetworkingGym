@@ -315,9 +315,12 @@ cpdef double calculate_osnr_observation(
         for span in link_data["link"].spans:
             # Usar parâmetros da banda se fornecida, senão usar span original
             if band is not None:
-                # Converter dB para linear
-                attenuation_normalized = (band.attenuation_db_km / 1000.0) / (10.0 * log10(exp(1)))
-                noise_figure_normalized = 10.0 ** (band.noise_figure_normalized / 10.0)
+                # Band já tem attenuation_normalized calculado
+                attenuation_normalized = band.attenuation_normalized
+                noise_figure_normalized = band.noise_figure_normalized
+            else:
+                attenuation_normalized = span.attenuation_normalized
+                noise_figure_normalized = span.noise_figure_normalized
          
             l_eff_a = 1.0 / (2.0 * attenuation_normalized)
             l_eff = (
