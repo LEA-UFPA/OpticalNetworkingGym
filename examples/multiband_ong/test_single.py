@@ -7,7 +7,9 @@ import logging
 import os
 import random
 from typing import List, Tuple
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
+import queue
+import threading
 
 import numpy as np
 import time
@@ -110,6 +112,7 @@ def define_modulations() -> Tuple[Modulation, ...]:
 def run_environment_with_monitoring(
     n_eval_episodes: int,
     heuristic_index: int,
+    band_name: str,
     monitor_file_name: str,
     topology,
     seed: int,
@@ -128,13 +131,13 @@ def run_environment_with_monitoring(
     gen_observation: bool,
     band_specs: List[dict] = None,
     debug: bool = False,
+    progress_queue = None,
+    worker_id: int = 0
 ) -> None:
     """
     Executa o ambiente com a heurística especificada e salva os resultados em um arquivo CSV.
     Baseado na função run_environment do graph_load.py
     """
-    
-
     
     # Configurações do ambiente - Usando band_specs diretamente se fornecido
     if band_specs:
@@ -174,7 +177,7 @@ def run_environment_with_monitoring(
             file_name=file_name,
             measure_disruptions=measure_disruptions,
             k_paths=2,
-            modulations_to_consider=len(mods),  # Usar número atual de modulações
+            modulations_to_consider=5,  # Usar número atual de modulações
             defragmentation=defragmentation,
             n_defrag_services=n_defrag_services,
             gen_observation=False,  # Forçar False para evitar problemas com high load
@@ -187,7 +190,7 @@ def run_environment_with_monitoring(
     env = QRMSAEnvWrapper(**env_args)
     
     # Criar arquivo CSV igual ao graph_load.py
-    monitor_final_name = f"load_results_{topology.name}_{load}.csv"
+    monitor_final_name = f"load_results_{topology.name}_{band_name}_{load}.csv"
     os.makedirs("results", exist_ok=True)
     
     with open(f"results/{monitor_final_name}", "wt") as f:
@@ -204,6 +207,13 @@ def run_environment_with_monitoring(
         f.write(header)
 
         for ep in range(n_eval_episodes):
+            if progress_queue:
+                # First time init for this task (or reset)
+                # We can send init message every episode, or just once per task.
+                # However, since tasks are granular (per load), we can treat each task as a bar reset.
+                # But here we loop episodes. Let's make the bar represent the episodes.
+                progress_queue.put((worker_id, 'init', n_eval_episodes, f"Worker {worker_id}: {band_name} Load {load}"))
+            
             obs, info = env.reset()
             done = False
             start_time = time.time()
@@ -213,8 +223,12 @@ def run_environment_with_monitoring(
                 action, path_id, mod_id = fn_heuristic(env)
                 obs, reward, done, truncated, info = env.step(action)
 
-                
                 step_count += 1
+                if progress_queue:
+                    progress_queue.put((worker_id, 'update', 1))
+
+            if progress_queue:
+                progress_queue.put((worker_id, 'done'))
                 
             end_time = time.time()
             ep_time = end_time - start_time
@@ -311,12 +325,50 @@ def create_environment(topology_name="nobel-eu.xml", episode_length=10, debug=Tr
         defragmentation=False,
         n_defrag_services=0,
         gen_observation=False,  # SOLUÇÃO: Desabilitar observação resolve o IndexError
-        # O erro ocorria em decimal_to_array quando tentava acessar modulation IDs
-        # que não existiam no array allowed_mods. Com gen_observation=False,
-        # o ambiente não tenta gerar observações e evita esse problema.
     )
     
     return env_args, debug
+
+
+def progress_listener(q, total_episodes_all_tasks):
+    """
+    Listener for tqdm progress bars.
+    """
+    bars = {}
+    # Global bar
+    global_bar = tqdm(total=total_episodes_all_tasks, desc="Total Simulation Progress", position=0)
+    
+    while True:
+        msg = q.get()
+        if msg == 'KILL':
+            break
+            
+        worker_id = msg[0]
+        action = msg[1]
+        
+        if action == 'init':
+            total = msg[2]
+            desc = msg[3]
+            if worker_id not in bars:
+                # Use position = worker_id + 1 to stack bars below global
+                bars[worker_id] = tqdm(total=total, desc=desc, position=worker_id+1, leave=False)
+            else:
+                bars[worker_id].reset(total=total)
+                bars[worker_id].set_description(desc)
+                
+        elif action == 'update':
+            steps = msg[2]
+            if worker_id in bars:
+                bars[worker_id].update(steps)
+            global_bar.update(steps)
+            
+        elif action == 'done':
+            if worker_id in bars:
+                bars[worker_id].set_description(f"Worker {worker_id} Idle")
+                
+    global_bar.close()
+    for b in bars.values():
+        b.close()
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -362,6 +414,12 @@ def parse_arguments() -> argparse.Namespace:
         default=0.0,
         help='Potência de lançamento em dBm (default: 0.0)'
     )
+    parser.add_argument(
+        '-th', '--threads',
+        type=int,
+        default=os.cpu_count(),
+        help='Número de processos/threads para execução paralela (default: todos os cores)'
+    )
     
     return parser.parse_args()
 
@@ -369,6 +427,20 @@ def main():
     """Função principal com opções de linha de comando baseada no graph_load.py"""
     args = parse_arguments()
     
+    # Print Simulation Parameters
+    print("\n" + "="*50)
+    print(f"  Optical Networking Gym - Simulation Configuration")
+    print("="*50)
+    print(f"  Topology File    : {args.topology_file}")
+    print(f"  Bands            : {', '.join(args.bands)}")
+    print(f"  Episodes         : {args.num_episodes}")
+    print(f"  Episode Length   : {args.episode_length}")
+    print(f"  Heuristic Index  : {args.heuristic_index}")
+    print(f"  Launch Power     : {args.power} dBm")
+    print(f"  Threads          : {args.threads}")
+    print(f"  Debug Mode       : {args.debug}")
+    print("="*50 + "\n")
+
     # Usar modulações completas
     cur_modulations = define_modulations()
 
@@ -404,6 +476,9 @@ def main():
     # Obter as cargas baseadas na topologia
     loads = get_loads(args.topology_file)
 
+    # Create a list of tasks for multiprocessing
+    tasks = []
+
     for band_name in args.bands:
         band_specs = band_specs_all[band_name]
         
@@ -420,31 +495,85 @@ def main():
         
         # Iterar sobre todas as cargas da topologia
         for current_load in loads:
-            # Executar simulação
-            run_environment_with_monitoring(
-                n_eval_episodes=args.num_episodes,
-                heuristic_index=args.heuristic_index,
-                monitor_file_name=None,
-                topology=topology,
-                seed=seed,
-                allow_rejection=True,
-                load=current_load,
-                episode_length=args.episode_length,
-                launch_power_dbm=args.power,
-                frequency_slot_bandwidth=12.5e9,
-                bit_rate_selection="discrete",
-                bit_rates=(48, 120),
-                margin=0,
-                file_name="",
-                measure_disruptions=False,
-                defragmentation=False,
-                n_defrag_services=0,
-                gen_observation=False,
-                band_specs=band_specs,
-                debug=args.debug
-            )
+            # Append task arguments tuple
+            tasks.append((
+                args.num_episodes,
+                args.heuristic_index,
+                band_name,
+                None, # monitor_file_name
+                topology,
+                seed,
+                True, # allow_rejection
+                current_load,
+                args.episode_length,
+                args.power,
+                12.5e9, # frequency_slot_bandwidth
+                "discrete", # bit_rate_selection
+                (48, 120), # bit_rates
+                0, # margin
+                "", # file_name
+                False, # measure_disruptions
+                False, # defragmentation
+                0, # n_defrag_services
+                False, # gen_observation
+                band_specs,
+                args.debug
+            ))
+
+    # Determine number of processes to use 
+    # Use user provided threads or fallback to safe minimum
+    num_processes = args.threads
+    if num_processes < 1:
+        num_processes = 1
+        
+    # Setup Manager and Queue
+    manager = Manager()
+    queue = manager.Queue()
+    
+    # Calculate total episodes
+    total_episodes_global = sum(t[0] for t in tasks)
+    
+    # Start listener
+    monitor_thread = threading.Thread(target=progress_listener, args=(queue, total_episodes_global))
+    monitor_thread.start()
+    
+    # Worker ID management
+    worker_id_queue = manager.Queue()
+    for i in range(num_processes):
+        worker_id_queue.put(i)
+        
+    def worker_init(q):
+        global process_worker_id
+        process_worker_id = q.get()
+
+    # Re-build tasks to include queue and placeholder
+    updated_tasks = []
+    for t in tasks:
+        l = list(t)
+        l.append(queue)
+        l.append(None) # Placeholder for worker_id
+        updated_tasks.append(tuple(l))
+
+    print(f"Iniciando simulação com {num_processes} processos para {len(tasks)} tarefas...")
+    
+    # Helper wrapper to inject worker_id
+    global run_wrapper
+    def run_wrapper(*args):
+        args_list = list(args)
+        args_list[-1] = process_worker_id
+        return run_environment_with_monitoring(*args_list)
+
+    with Pool(processes=num_processes, initializer=worker_init, initargs=(worker_id_queue,)) as pool:
+        pool.starmap(run_wrapper, updated_tasks)
+
+    # Stop listener
+    queue.put('KILL')
+    monitor_thread.join()
 
     print("\nTodas as simulações foram executadas.")
+
+# Global to store worker ID in each process
+process_worker_id = 0
 
 if __name__ == "__main__":
     main()
