@@ -30,7 +30,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(700, 2401, 100)  # Usando valores seguros do graph_load.py
+        return np.arange(700, 1000, 100)  # Usando valores seguros do graph_load.py
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -199,11 +199,18 @@ def run_environment_with_monitoring(
         header = (
             "episode,service_blocking_rate,episode_service_blocking_rate,"
             "bit_rate_blocking_rate,episode_bit_rate_blocking_rate,"
-            "episode_service_realocations,episode_defrag_cicles"
+            "episode_service_realocations,episode_defrag_cicles,"
+            "blocked_due_to_resources,blocked_due_to_osnr,"
+            "blocked_due_to_ase,blocked_due_to_nli"
         )
         for mf in env.env.modulations:
             header += f",modulation_{mf.spectral_efficiency}"
-        header += ",episode_disrupted_services,episode_time,mean_gsnr\n"
+        header += ",episode_disrupted_services,episode_time,mean_gsnr,mean_ase,mean_nli,current_occupancy"
+        
+        # Dinamicamente adicionar ocupação e bloqueios por banda
+        for band in env.env.bands:
+            header += f",occupancy_{band.name},bl_res_{band.name},bl_osnr_{band.name}"
+        header += "\n"
         f.write(header)
 
         for ep in range(n_eval_episodes):
@@ -243,17 +250,43 @@ def run_environment_with_monitoring(
                 f"{info['bit_rate_blocking_rate']},"
                 f"{info['episode_bit_rate_blocking_rate']},"
                 f"{info['episode_service_realocations']},"
-                f"{info['episode_defrag_cicles']}"
+                f"{info['episode_defrag_cicles']},"
+                f"{info.get('blocked_due_to_resources', 0)},"
+                f"{info.get('blocked_due_to_osnr', 0)},"
+                f"{info.get('blocked_due_to_ase_dominant', 0)},"
+                f"{info.get('blocked_due_to_nli_dominant', 0)}"
             )
             for mf in env.env.modulations:
                 row += f",{info.get(f'modulation_{mf.spectral_efficiency}', 0.0)}"
             row += f",{info.get('episode_disrupted_services', 0)},{ep_time:.2f}"
+            
             mean_gsnr = 0.0
+            mean_ase = 0.0
+            mean_nli = 0.0
+            accepted_count = 0
+            
             if len(env.env.topology.graph["services"]) > 0:
                 for service in env.env.topology.graph["services"]:
-                    mean_gsnr += service.OSNR
-                mean_gsnr /= len(env.env.topology.graph["services"])
-            row += f",{mean_gsnr}\n"
+                    if service.accepted:
+                        mean_gsnr += service.OSNR
+                        mean_ase += service.ASE
+                        mean_nli += service.NLI
+                        accepted_count += 1
+                
+                if accepted_count > 0:
+                    mean_gsnr /= accepted_count
+                    mean_ase /= accepted_count
+                    mean_nli /= accepted_count
+            
+            row += f",{mean_gsnr},{mean_ase},{mean_nli},{info.get('current_occupancy', 0.0)}"
+            
+            # Adicionar dados por banda
+            for band in env.env.bands:
+                row += f",{info.get(f'occupancy_{band.name}', 0.0)}"
+                row += f",{info.get(f'bl_resource_{band.name}', 0)}"
+                row += f",{info.get(f'bl_osnr_{band.name}', 0)}"
+            
+            row += "\n"
             f.write(row)
 
     print(f"\nFinalizado! Resultados salvos em: results/{monitor_final_name}")
@@ -382,19 +415,19 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-e', '--num_episodes',
         type=int,
-        default=5,
+        default=1,
         help='Número de episódios a serem simulados (default: 5)'
     )
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=100000,
+        default=10000,
         help='Número de chegadas por episódio (default: 100)'
     )
     parser.add_argument(
         '-hi', '--heuristic_index',
         type=int,
-        default=1,
+        default=3,
         choices=[1,2,3],
         help='Índice da heurística (1: First fit, 2: shortest_available_path_first_fit_best_modulation_best_band, 3: get_best_band_path_pso)'
     )
