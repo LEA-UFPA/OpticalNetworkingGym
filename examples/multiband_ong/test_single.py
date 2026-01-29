@@ -21,7 +21,8 @@ from optical_networking_gym.wrappers.qrmsa_gym import QRMSAEnvWrapper
 from optical_networking_gym.heuristics.heuristics import (
     shortest_available_path_first_fit_best_modulation_best_band,
     heuristic_shortest_available_path_first_fit_best_modulation,
-    get_best_band_path_pso
+    get_best_band_path_pso,
+    heuristic_ms_osnr
 )
 
 # ===================================================
@@ -30,7 +31,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(700, 2401, 100)  # Usando valores seguros do graph_load.py
+        return np.arange(100, 2401, 100)  # Usando valores seguros do graph_load.py
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -50,6 +51,8 @@ def get_heuristic_function(heuristic_index: int):
         return shortest_available_path_first_fit_best_modulation_best_band
     elif heuristic_index == 3:
         return get_best_band_path_pso
+    elif heuristic_index == 4:
+        return heuristic_ms_osnr
     else:
         raise ValueError(f"Heuristic index `{heuristic_index}` is not found!")
 
@@ -394,7 +397,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-hi', '--heuristic_index',
         type=int,
-        default=1,
+        default=3,
         choices=[1,2,3],
         help='Índice da heurística (1: First fit, 2: shortest_available_path_first_fit_best_modulation_best_band, 3: get_best_band_path_pso)'
     )
@@ -475,6 +478,40 @@ def main():
 
     # Obter as cargas baseadas na topologia
     loads = get_loads(args.topology_file)
+
+    # ===================================================
+    # Salvar parâmetros da simulação em arquivo params
+    # ===================================================
+    os.makedirs("results", exist_ok=True)
+    with open("results/params", "w") as f_params:
+        f_params.write(f"Simulation Parameters\n")
+        f_params.write(f"Date: {datetime.now()}\n")
+        f_params.write(f"================================\n\n")
+        
+        f_params.write(f"Topology: {args.topology_file}\n")
+        f_params.write(f"Episodes: {args.num_episodes}\n")
+        f_params.write(f"Episode Length: {args.episode_length}\n")
+        f_params.write(f"Heuristic Index: {args.heuristic_index}\n")
+        f_params.write(f"Bands: {args.bands}\n")
+        f_params.write(f"Launch Power: {args.power} dBm\n")
+        f_params.write(f"Threads: {args.threads}\n")
+        f_params.write(f"Debug: {args.debug}\n\n")
+        
+        f_params.write(f"Fixed Parameters:\n")
+        f_params.write(f"  K-Paths: 2\n")
+        f_params.write(f"  Slot Bandwidth: 12.5 GHz\n")
+        f_params.write(f"  Bit Rates: (48, 120) Gbps\n")
+        f_params.write(f"  Max Span Length: 100 km\n")
+        f_params.write(f"  Attenuation: 0.2 dB/km\n")
+        f_params.write(f"  Noise Figure: 4.5 dB\n")
+        f_params.write(f"  Loads to be simulated: {loads}\n")
+        
+        f_params.write(f"\nBand Specifications:\n")
+        for band in args.bands:
+            f_params.write(f"  {band}:\n")
+            for spec in band_specs_all[band]:
+                f_params.write(f"    {spec}\n")
+
 
     # Create a list of tasks for multiprocessing
     tasks = []
