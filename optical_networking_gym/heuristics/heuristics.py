@@ -79,12 +79,25 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     Returns:
         int: Índice da ação correspondente.
     """
-    # Ambiente decodifica ações multibanda usando slots_per_band (primeira banda) e
-    # modulação relativa (allowed_mods). Precisamos gerar o mesmo índice.
+    # IMPORTANTE: O ambiente decodifica usando bands[0].num_slots como referência
+    # Isso significa que bandas maiores podem ter slots inacessíveis via ações
     slots_per_band = env.bands[0].num_slots if env.bands else env.num_spectrum_resources
-    if slot_in_band < 0 or slot_in_band >= slots_per_band:
+    
+    # Validar se o slot está dentro dos limites da banda alvo
+    target_band = env.bands[band_index]
+    if slot_in_band < 0 or slot_in_band >= target_band.num_slots:
         raise ValueError(
-            f"slot_in_band {slot_in_band} fora do intervalo 0..{slots_per_band-1} para banda {band_index}"
+            f"slot_in_band {slot_in_band} fora do intervalo 0..{target_band.num_slots-1} "
+            f"para banda {band_index} ({target_band.name})"
+        )
+    
+    # CRÍTICO: Validar se o slot está dentro do limite usado para decodificação
+    # Se a banda alvo for maior que bands[0], alguns slots ficam inacessíveis
+    if slot_in_band >= slots_per_band:
+        raise ValueError(
+            f"slot_in_band {slot_in_band} excede o limite de decodificação {slots_per_band} "
+            f"(tamanho da primeira banda). Banda {target_band.name} tem {target_band.num_slots} slots, "
+            f"mas apenas os primeiros {slots_per_band} são acessíveis."
         )
 
     # Mapeia modulação absoluta para índice relativo usado no espaço de ações
@@ -233,8 +246,9 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 # para o slot relativo dentro da faixa da banda
                 slot_in_band = global_candidate_start - band.slot_start
                 
-                # Verificar se o slot relativo está dentro dos limites da banda uniforme
-                if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+                # Verificar se o slot relativo está dentro dos limites da banda atual
+                # CORREÇÃO: Usar band.num_slots em vez de sim_env.bands[0].num_slots
+                if slot_in_band < 0 or slot_in_band >= band.num_slots:
                     continue
                 
                 # Configurar o serviço para teste de OSNR
@@ -472,7 +486,9 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
 
             global_candidate_start = valid_starts[0]
             slot_in_band = global_candidate_start - band.slot_start
-            if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+            # CORREÇÃO: Usar o tamanho da banda atual (band.num_slots) em vez de assumir 
+            # que todas as bandas têm o mesmo tamanho (sim_env.bands[0].num_slots)
+            if slot_in_band < 0 or slot_in_band >= band.num_slots:
                 continue
 
             candidate_service = service
