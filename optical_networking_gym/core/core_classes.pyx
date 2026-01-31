@@ -90,7 +90,7 @@ cdef class Service:
                  float bit_rate=0.0, object path=None, int service_class=0,
                  int initial_slot=0, int center_frequency=0, int bandwidth=0,
                  int number_slots=0, int core=0, float launch_power=0.0,
-                 bint accepted=False, bint blocked_due_to_resources=True, bint blocked_due_to_osnr=True,
+                 bint accepted=False, bint blocked_due_to_resources=False, bint blocked_due_to_osnr=False,
                  float OSNR=0.0, float ASE=0.0, float NLI=0.0, object current_modulation=None):
 
         self.service_id = service_id

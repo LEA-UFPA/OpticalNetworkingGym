@@ -467,7 +467,12 @@ cdef class QRMSAEnv:
     cdef int blocks_to_consider
     cdef int bl_resource 
     cdef int bl_osnr 
+    cdef int bl_ase_dominant
+    cdef int bl_nli_dominant
+    cdef int bl_fragmentation # Novo: bloqueio especificamente por fragmentação
     cdef int bl_reject
+    cdef public object bl_band_resource
+    cdef public object bl_band_osnr
     cdef public int max_modulation_idx
     cdef public int modulations_to_consider
     cdef int spectrum_efficiency_metric
@@ -702,8 +707,13 @@ cdef class QRMSAEnv:
             self.file_stats = None
 
         self.bl_osnr = 0
+        self.bl_ase_dominant = 0
+        self.bl_nli_dominant = 0
+        self.bl_fragmentation = 0
         self.bl_resource = 0
         self.bl_reject = 0
+        self.bl_band_resource = defaultdict(int)
+        self.bl_band_osnr = defaultdict(int)
         self.spectrum_efficiency_metric = 0
         self.episode_defrag_cicles = 0
         self.episode_service_realocations = 0
@@ -792,7 +802,12 @@ cdef class QRMSAEnv:
         self._events = []
         self.bl_resource = 0
         self.bl_osnr = 0
+        self.bl_ase_dominant = 0
+        self.bl_nli_dominant = 0
+        self.bl_fragmentation = 0
         self.bl_reject = 0
+        self.bl_band_resource = defaultdict(int)
+        self.bl_band_osnr = defaultdict(int)
         self.max_modulation_idx = len(self.modulations) - 1
         self.episode_defrag_cicles = 0
         self.episode_service_realocations = 0
@@ -1347,14 +1362,31 @@ cdef class QRMSAEnv:
         cdef Band band = None  # Nova variável para banda
         cdef list services_to_measure = []
         cdef dict info
+        cdef cnp.ndarray[cnp.int32_t, ndim=1] path_spectrum
+        cdef cnp.ndarray[cnp.int32_t, ndim=1] edge_indices_frag
 
-        self.current_service.blocked_due_to_resources = False
-        self.current_service.blocked_due_to_osnr = False
+        # IMPORTANTE: Só resetar os flags se NÃO for ação de rejeição
+        # Caso seja rejeição, a heurística já setou os flags antes de chamar step()
+        if action != (self.action_space.n - 1):
+            self.current_service.blocked_due_to_resources = False
+            self.current_service.blocked_due_to_osnr = False
 
         if action == (self.action_space.n - 1):
             self.current_service.accepted = False
-            self.current_service.blocked_due_to_resources = False
-            self.current_service.blocked_due_to_osnr = False
+            # Incrementar contadores baseados nos flags setados pela heurística
+            if self.current_service.blocked_due_to_resources:
+                self.bl_resource += 1
+                # Não temos informação sobre qual banda causou o bloqueio neste caso
+                # A heurística não passa essa informação
+            if self.current_service.blocked_due_to_osnr:
+                self.bl_osnr += 1
+                # Se a heurística já calculou ASE e NLI, usar essa informação
+                # para determinar qual é dominante
+                if self.current_service.ASE > 0 and self.current_service.NLI > 0:
+                    if self.current_service.ASE > self.current_service.NLI:
+                        self.bl_ase_dominant += 1
+                    else:
+                        self.bl_nli_dominant += 1
             self.bl_reject += 1
         else:
             # Usar decodificação com slots por banda: [k_path, band_idx, mod_idx_relative, slot_relative]
@@ -1432,10 +1464,30 @@ cdef class QRMSAEnv:
                 else:
                     #print(f"[DEBUG QRMSA] ❌ Service {self.current_service.service_id} BLOCKED - OSNR insuficiente!")
                     self.bl_osnr += 1
+                    self.bl_band_osnr[band.name] += 1
+                    self.current_service.accepted = False
+                    self.current_service.OSNR = osnr
+                    self.current_service.ASE = ase
+                    self.current_service.NLI = nli
+                    if ase > nli:
+                        self.bl_ase_dominant += 1
+                    else:
+                        self.bl_nli_dominant += 1
             else:
                 self.current_service.accepted = False
                 self.current_service.blocked_due_to_resources = True
                 self.bl_resource += 1
+                self.bl_band_resource[band.name] += 1
+                
+                # Check if it was because of fragmentation (there are enough slots total, but not contiguous/continuous)
+                # This is a heuristic check: pick the path and see if it has enough slots total
+                path_spectrum = self.fast_ops.vectorized_spectrum_product(self.fast_ops.extract_edge_indices(path))
+                if np.sum(path_spectrum) >= number_slots:
+                    self.bl_fragmentation += 1
+                
+                self.current_service.OSNR = 0.0
+                self.current_service.ASE = 0.0
+                self.current_service.NLI = 0.0
 
         if self.measure_disruptions and self.current_service.accepted:
             services_to_measure = []
@@ -1468,9 +1520,10 @@ cdef class QRMSAEnv:
             self.current_service.path = None
             self.current_service.initial_slot = -1
             self.current_service.number_slots = 0
-            self.current_service.OSNR = 0.0
-            self.current_service.ASE = 0.0
-            self.current_service.NLI = 0.0
+            # Manter OSNR, ASE, NLI para o log CSV antes de limpar se necessário
+            # self.current_service.OSNR = 0.0 
+            # self.current_service.ASE = 0.0
+            # self.current_service.NLI = 0.0
             self.current_service.current_band = None  # Limpar banda
 
         if self.file_stats is not None:
@@ -1515,12 +1568,41 @@ cdef class QRMSAEnv:
             "disrupted_services": 0.0,
             "episode_disrupted_services": 0.0,
             "osnr": osnr,
+            "ase": ase,
+            "nli": nli,
             "osnr_req": osnr_req,
             "chosen_path_index": route,
             "chosen_slot": initial_slot,
             "episode_defrag_cicles": self.episode_defrag_cicles,
             "episode_service_realocations": self.episode_service_realocations,
+            "current_occupancy": np.mean(1.0 - self.topo_cache.available_slots),
+            "bl_fragmentation": self.bl_fragmentation,
         }
+
+        # Adicionar estatísticas por banda
+        cdef Band b_info
+        cdef double b_occ
+        for b_info in self.bands:
+            b_occ = np.mean(1.0 - self.topo_cache.available_slots[:, b_info.slot_start:b_info.slot_end])
+            info[f"occupancy_{b_info.name}"] = b_occ
+            info[f"bl_resource_{b_info.name}"] = self.bl_band_resource[b_info.name]
+            info[f"bl_osnr_{b_info.name}"] = self.bl_band_osnr[b_info.name]
+            
+        # Calcular fragmentação externa (Shannon Entropy ou similar simplificado)
+        # fragmentation = 1 - (max_contiguous_block / total_free_slots)
+        cdef double frag_sum = 0.0
+        cdef int edge_idx_frag
+        cdef cnp.ndarray[cnp.int32_t, ndim=1] slots
+        for edge_idx_frag in range(self.topo_cache.num_edges):
+            slots = self.topo_cache.available_slots[edge_idx_frag, :]
+            # Simples aproximação de fragmentação por edge
+            runs = rle(slots)
+            free_slots = np.sum(slots)
+            if free_slots > 0:
+                max_run = np.max(runs[1][runs[0] == 1]) if 1 in runs[0] else 0
+                frag_sum += 1.0 - (float(max_run) / free_slots)
+        
+        info["network_fragmentation"] = frag_sum / self.topo_cache.num_edges
 
         if self.services_processed > 0:
             info["service_blocking_rate"] = float(
@@ -1570,10 +1652,18 @@ cdef class QRMSAEnv:
         if terminated:
             info["blocked_due_to_resources"] = self.bl_resource
             info["blocked_due_to_osnr"] = self.bl_osnr
+            info["blocked_due_to_ase_dominant"] = self.bl_ase_dominant
+            info["blocked_due_to_nli_dominant"] = self.bl_nli_dominant
             info["rejected"] = self.bl_reject
 
         observation, mask = self.observation()
         info.update(mask)
+
+        # Agora sim podemos limpar os valores do serviço atual se ele foi bloqueado
+        if not self.current_service.accepted:
+            self.current_service.OSNR = 0.0
+            self.current_service.ASE = 0.0
+            self.current_service.NLI = 0.0
 
         return (observation, reward, terminated, truncated, info)
 

@@ -79,12 +79,25 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     Returns:
         int: Índice da ação correspondente.
     """
-    # Ambiente decodifica ações multibanda usando slots_per_band (primeira banda) e
-    # modulação relativa (allowed_mods). Precisamos gerar o mesmo índice.
+    # IMPORTANTE: O ambiente decodifica usando bands[0].num_slots como referência
+    # Isso significa que bandas maiores podem ter slots inacessíveis via ações
     slots_per_band = env.bands[0].num_slots if env.bands else env.num_spectrum_resources
-    if slot_in_band < 0 or slot_in_band >= slots_per_band:
+    
+    # Validar se o slot está dentro dos limites da banda alvo
+    target_band = env.bands[band_index]
+    if slot_in_band < 0 or slot_in_band >= target_band.num_slots:
         raise ValueError(
-            f"slot_in_band {slot_in_band} fora do intervalo 0..{slots_per_band-1} para banda {band_index}"
+            f"slot_in_band {slot_in_band} fora do intervalo 0..{target_band.num_slots-1} "
+            f"para banda {band_index} ({target_band.name})"
+        )
+    
+    # CRÍTICO: Validar se o slot está dentro do limite usado para decodificação
+    # Se a banda alvo for maior que bands[0], alguns slots ficam inacessíveis
+    if slot_in_band >= slots_per_band:
+        raise ValueError(
+            f"slot_in_band {slot_in_band} excede o limite de decodificação {slots_per_band} "
+            f"(tamanho da primeira banda). Banda {target_band.name} tem {target_band.num_slots} slots, "
+            f"mas apenas os primeiros {slots_per_band} são acessíveis."
         )
 
     # Mapeia modulação absoluta para índice relativo usado no espaço de ações
@@ -107,12 +120,23 @@ def get_multiband_action_index(env: QRMSAEnv, path_index: int, band_index: int,
     return action_index
 
 
-def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int:
+def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> tuple[int, bool, bool, dict]:
+    """
+    Heurística com informações detalhadas sobre bloqueios.
+    
+    Returns:
+        tuple: (action_index, blocked_resources, blocked_osnr, blocking_info)
+        onde blocking_info contém: {'ase': float, 'nli': float, 'osnr': float, 
+                                     'osnr_req': float, 'band': str or None}
+    """
     blocked_due_to_resources, blocked_due_to_osnr = False, False
+    blocking_info = {'ase': 0.0, 'nli': 0.0, 'osnr': 0.0, 'osnr_req': 0.0, 'band': None}
+    
     sim_env = get_qrmsa_env(env)
     source = sim_env.current_service.source
     destination = sim_env.current_service.destination
     k_paths = sim_env.k_shortest_paths[source, destination]
+    
     for path_idx, path in enumerate(k_paths):
         for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
             modulation = sim_env.modulations[modulation_idx]
@@ -142,6 +166,7 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
                         service.center_frequency = band.center_frequency_hz_from_global(
                             candidate_start, required_slots
                         )
+                        blocking_info['band'] = band.name  # Registrar banda
                         break
                 else:
                     # Se nenhuma banda contém o slot, usar a primeira banda como fallback
@@ -150,6 +175,7 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
                         sim_env.frequency_start +
                         (sim_env.frequency_slot_bandwidth * candidate_start) +
                         (sim_env.frequency_slot_bandwidth * (required_slots / 2)))
+                    blocking_info['band'] = sim_env.bands[0].name
             else:
                 # Ambiente single-band tradicional
                 service.current_band = None
@@ -161,23 +187,36 @@ def heuristic_shortest_available_path_first_fit_best_modulation(env: Env) -> int
             service.bandwidth = sim_env.frequency_slot_bandwidth * required_slots
             service.launch_power = sim_env.launch_power
             
-            osnr, _, _ = calculate_osnr(sim_env, service)
+            # Calcular OSNR, ASE e NLI
+            osnr, ase, nli = calculate_osnr(sim_env, service)
             
             threshold = modulation.minimum_osnr + sim_env.margin
             if osnr >= threshold:
                 action_index = get_action_index(sim_env, path_idx, modulation_idx, candidate_start)
-                return action_index, False, False 
+                return action_index, False, False, blocking_info
             else:
                 blocked_due_to_osnr = True
+                # Salvar informações detalhadas do bloqueio
+                blocking_info['osnr'] = osnr
+                blocking_info['ase'] = ase
+                blocking_info['nli'] = nli
+                blocking_info['osnr_req'] = threshold
                 if blocked_due_to_resources:
                     blocked_due_to_resources = False
     
-    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
+    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr, blocking_info 
 
 
-def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tuple[int, bool, bool]:
-
+def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tuple[int, bool, bool, dict]:
+    """
+    Heurística multibanda com informações detalhadas sobre bloqueios.
+    
+    Returns:
+        tuple: (action_index, blocked_resources, blocked_osnr, blocking_info)
+    """
     blocked_due_to_resources, blocked_due_to_osnr = False, False
+    blocking_info = {'ase': 0.0, 'nli': 0.0, 'osnr': 0.0, 'osnr_req': 0.0, 'band': None}
+    
     sim_env = get_qrmsa_env(env)
     source = sim_env.current_service.source
     destination = sim_env.current_service.destination
@@ -233,8 +272,9 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 # para o slot relativo dentro da faixa da banda
                 slot_in_band = global_candidate_start - band.slot_start
                 
-                # Verificar se o slot relativo está dentro dos limites da banda uniforme
-                if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+                # Verificar se o slot relativo está dentro dos limites da banda atual
+                # CORREÇÃO: Usar band.num_slots em vez de sim_env.bands[0].num_slots
+                if slot_in_band < 0 or slot_in_band >= band.num_slots:
                     continue
                 
                 # Configurar o serviço para teste de OSNR
@@ -244,6 +284,7 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 service.number_slots = required_slots
                 service.current_modulation = modulation
                 service.current_band = band
+                blocking_info['band'] = band.name  # Registrar banda
                 
                 # Calcular frequência central usando a banda
                 try:
@@ -264,7 +305,7 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                 
                 # Verificar OSNR
                 try:
-                    osnr, _, _ = calculate_osnr(sim_env, service)
+                    osnr, ase, nli = calculate_osnr(sim_env, service)
                     
                     threshold = modulation.minimum_osnr + sim_env.margin
                     
@@ -279,9 +320,14 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                             print(f"ERRO: action_index {action_index} >= action_space.n {sim_env.action_space.n}")
                             continue
                         
-                        return action_index, False, False
+                        return action_index, False, False, blocking_info
                     else:
                         blocked_due_to_osnr = True
+                        # Salvar informações detalhadas do bloqueio
+                        blocking_info['osnr'] = osnr
+                        blocking_info['ase'] = ase
+                        blocking_info['nli'] = nli
+                        blocking_info['osnr_req'] = threshold
                         # Reset blocked_due_to_resources se há problema de OSNR
                         if blocked_due_to_resources:
                             blocked_due_to_resources = False
@@ -289,10 +335,10 @@ def shortest_available_path_first_fit_best_modulation_best_band(env: Env) -> tup
                     print(f"Erro no cálculo de OSNR: {e}")
                     blocked_due_to_osnr = True
     
-    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr 
+    return env.action_space.n - 1, blocked_due_to_resources, blocked_due_to_osnr, blocking_info 
 
 
-def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
+def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool, dict]:
     """
     Heurística PSO para seleção de banda e caminho em ambiente multiband.
     
@@ -304,7 +350,7 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
         env: Ambiente Gym (potencialmente wrapped).
         
     Returns:
-        tuple[int, bool, bool]: (action_index, blocked_resources, blocked_osnr)
+        tuple[int, bool, bool, dict]: (action_index, blocked_resources, blocked_osnr, blocking_info)
     """
     if not HAS_PYSWARMS:
         # Fallback para heurística padrão se PySwarms não estiver instalado
@@ -436,7 +482,7 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
             bounds=bounds,
         )
         try:
-            _, pos = optimizer.optimize(pso_objective, iters=24, verbose=False)
+            _, pos = optimizer.optimize(pso_objective, iters=10, verbose=False)
             # Garantir que pos não contém NaN
             if not np.all(np.isfinite(pos)):
                 best_path_idx, best_band_idx = 0, 0
@@ -446,12 +492,15 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
             # Se PSO falhar, usar valores padrão
             best_path_idx, best_band_idx = 0, 0
 
-    def allocate_with_first_fit(path_idx: int, band_idx: int) -> tuple[Optional[int], bool, bool]:
+    def allocate_with_first_fit(path_idx: int, band_idx: int) -> tuple[Optional[int], bool, bool, dict]:
         # Depois da escolha via PSO, caia no fluxo first-fit existente para modularização e slots
         blocked_resources = False
         blocked_osnr = False
+        blocking_info = {'ase': 0.0, 'nli': 0.0, 'osnr': 0.0, 'osnr_req': 0.0, 'band': None}
+        
         path = k_paths[path_idx]
         band = sim_env.bands[band_idx]
+        blocking_info['band'] = band.name
         available_slots = sim_env.get_available_slots(path)
 
         for modulation_idx in range(sim_env.max_modulation_idx, -1, -1):
@@ -472,7 +521,9 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
 
             global_candidate_start = valid_starts[0]
             slot_in_band = global_candidate_start - band.slot_start
-            if slot_in_band < 0 or slot_in_band >= sim_env.bands[0].num_slots:
+            # CORREÇÃO: Usar o tamanho da banda atual (band.num_slots) em vez de assumir 
+            # que todas as bandas têm o mesmo tamanho (sim_env.bands[0].num_slots)
+            if slot_in_band < 0 or slot_in_band >= band.num_slots:
                 continue
 
             candidate_service = service
@@ -497,7 +548,7 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
             candidate_service.launch_power = sim_env.launch_power
 
             try:
-                osnr, _, _ = calculate_osnr(sim_env, candidate_service)
+                osnr, ase, nli = calculate_osnr(sim_env, candidate_service)
             except Exception:
                 blocked_osnr = True
                 continue
@@ -508,16 +559,21 @@ def get_best_band_path_pso(env: Env) -> tuple[int, bool, bool]:
                     sim_env, path_idx, band_idx, modulation_idx, slot_in_band
                 )
                 if action_index < sim_env.action_space.n:
-                    return action_index, False, False
+                    return action_index, False, False, blocking_info
             else:
                 blocked_osnr = True
+                # Salvar informações detalhadas do bloqueio
+                blocking_info['osnr'] = osnr
+                blocking_info['ase'] = ase
+                blocking_info['nli'] = nli
+                blocking_info['osnr_req'] = threshold
                 if blocked_resources:
                     blocked_resources = False
 
-        return None, blocked_resources, blocked_osnr
+        return None, blocked_resources, blocked_osnr, blocking_info
 
-    action_index, blocked_resources, blocked_osnr = allocate_with_first_fit(best_path_idx, best_band_idx)
+    action_index, blocked_resources, blocked_osnr, blocking_info = allocate_with_first_fit(best_path_idx, best_band_idx)
     if action_index is not None:
-        return action_index, blocked_resources, blocked_osnr
+        return action_index, blocked_resources, blocked_osnr, blocking_info
 
     return shortest_available_path_first_fit_best_modulation_best_band(env)
