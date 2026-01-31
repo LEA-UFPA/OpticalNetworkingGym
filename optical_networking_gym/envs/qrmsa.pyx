@@ -1365,13 +1365,28 @@ cdef class QRMSAEnv:
         cdef cnp.ndarray[cnp.int32_t, ndim=1] path_spectrum
         cdef cnp.ndarray[cnp.int32_t, ndim=1] edge_indices_frag
 
-        self.current_service.blocked_due_to_resources = False
-        self.current_service.blocked_due_to_osnr = False
+        # IMPORTANTE: Só resetar os flags se NÃO for ação de rejeição
+        # Caso seja rejeição, a heurística já setou os flags antes de chamar step()
+        if action != (self.action_space.n - 1):
+            self.current_service.blocked_due_to_resources = False
+            self.current_service.blocked_due_to_osnr = False
 
         if action == (self.action_space.n - 1):
             self.current_service.accepted = False
-            self.current_service.blocked_due_to_resources = False
-            self.current_service.blocked_due_to_osnr = False
+            # Incrementar contadores baseados nos flags setados pela heurística
+            if self.current_service.blocked_due_to_resources:
+                self.bl_resource += 1
+                # Não temos informação sobre qual banda causou o bloqueio neste caso
+                # A heurística não passa essa informação
+            if self.current_service.blocked_due_to_osnr:
+                self.bl_osnr += 1
+                # Se a heurística já calculou ASE e NLI, usar essa informação
+                # para determinar qual é dominante
+                if self.current_service.ASE > 0 and self.current_service.NLI > 0:
+                    if self.current_service.ASE > self.current_service.NLI:
+                        self.bl_ase_dominant += 1
+                    else:
+                        self.bl_nli_dominant += 1
             self.bl_reject += 1
         else:
             # Usar decodificação com slots por banda: [k_path, band_idx, mod_idx_relative, slot_relative]

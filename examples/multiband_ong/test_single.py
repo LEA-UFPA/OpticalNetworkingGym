@@ -30,7 +30,7 @@ from optical_networking_gym.heuristics.heuristics import (
 def get_loads(topology_name: str) -> np.ndarray:
     """Retorna as cargas apropriadas para cada topologia"""
     if topology_name == "nobel-eu.xml":
-        return np.arange(700, 1000, 100)  # Usando valores seguros do graph_load.py
+        return np.arange(100, 2700, 100)  # Usando valores seguros do graph_load.py
     elif topology_name == "germany50.xml":
         return np.arange(100, 1501, 100)
     elif topology_name == "janos-us.xml":
@@ -227,7 +227,22 @@ def run_environment_with_monitoring(
             step_count = 0
             
             while not done:
-                action, path_id, mod_id = fn_heuristic(env)
+                action, blocked_resources, blocked_osnr, blocking_info = fn_heuristic(env)
+                
+                # Se a ação é de rejeição e a heurística detectou o motivo, 
+                # precisamos informar ao ambiente através do current_service
+                if action == (env.action_space.n - 1):
+                    env.env.current_service.blocked_due_to_resources = blocked_resources
+                    env.env.current_service.blocked_due_to_osnr = blocked_osnr
+                    
+                    # Passar informações detalhadas de bloqueio
+                    if blocking_info['osnr'] > 0:
+                        env.env.current_service.OSNR = blocking_info['osnr']
+                    if blocking_info['ase'] > 0:
+                        env.env.current_service.ASE = blocking_info['ase']
+                    if blocking_info['nli'] > 0:
+                        env.env.current_service.NLI = blocking_info['nli']
+                
                 obs, reward, done, truncated, info = env.step(action)
 
                 step_count += 1
@@ -421,7 +436,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '-s', '--episode_length',
         type=int,
-        default=10000,
+        default=100000,
         help='Número de chegadas por episódio (default: 100)'
     )
     parser.add_argument(
