@@ -1,3 +1,5 @@
+# add gdb debug
+# add 
 from typing import Any, Literal, Sequence, SupportsFloat, Optional
 from dataclasses import field
 
@@ -187,6 +189,7 @@ cdef class QRMSAEnv:
     cdef public double margin
     cdef public object modulations
     cdef public str qot_constraint
+    cdef public object osnr_calculator
     cdef bint measure_disruptions
     cdef public object _np_random
     cdef public int _np_random_seed
@@ -211,6 +214,7 @@ cdef class QRMSAEnv:
     cdef int disrupted_services
     cdef int episode_disrupted_services
     cdef list disrupted_services_list
+    cdef object disrupted_services_ids
     cdef public object action_space
     cdef public object observation_space
     cdef object episode_actions_output
@@ -352,6 +356,7 @@ cdef class QRMSAEnv:
         self.frequency_slot_bandwidth = frequency_slot_bandwidth
         self.margin = margin
         self.qot_constraint = qot_constraint
+        self.osnr_calculator = None
         self.measure_disruptions = measure_disruptions
         self.frequency_end = self.frequency_start + (self.frequency_slot_bandwidth * self.num_spectrum_resources)
         assert math.isclose(self.frequency_end - self.frequency_start, self.bandwidth, rel_tol=1e-5)
@@ -374,6 +379,7 @@ cdef class QRMSAEnv:
         self.max_modulation_idx = len(self.modulations) - 1
         self.modulations_to_consider = min(modulations_to_consider, len(self.modulations))
         self.disrupted_services_list = []
+        self.disrupted_services_ids = set()
         self.disrupted_services = 0
         self.episode_disrupted_services = 0
 
@@ -510,6 +516,85 @@ cdef class QRMSAEnv:
         self.fragmentation_cache = {}
         self.slot_window_cache = {}
 
+    cdef tuple _calculate_service_osnr(self, object service):
+        if self.osnr_calculator is None:
+            return calculate_osnr(self, service, self.qot_constraint)
+        return self.osnr_calculator(self, service, self.qot_constraint)
+
+    cdef double _get_required_osnr(self, object service):
+        return service.current_modulation.minimum_osnr + self.margin
+
+    cdef bint _refresh_service_qot(self, Service service):
+        cdef double osnr = 0.0
+        cdef double ase = 0.0
+        cdef double nli = 0.0
+        cdef double path_distance = 0.0
+        cdef bint qot_acceptable = True
+
+        if service.path is None or service.current_modulation is None:
+            return True
+
+        if self.qot_constraint == "DIST":
+            path_distance = service.path.length
+            qot_acceptable = path_distance <= service.current_modulation.maximum_length
+            osnr = 0.0 if qot_acceptable else -1.0
+            ase = 0.0
+            nli = 0.0
+        else:
+            osnr, ase, nli = self._calculate_service_osnr(service)
+            qot_acceptable = osnr >= self._get_required_osnr(service)
+
+        service.OSNR = osnr
+        service.ASE = ase
+        service.NLI = nli
+        return qot_acceptable
+
+    cdef list _collect_impacted_services(self, object path, int excluded_service_id):
+        cdef list services_to_measure = []
+        cdef object link
+        cdef dict link_data
+        cdef object service_in_link
+        cdef object seen_ids = set()
+
+        for link in path.links:
+            link_data = self.link_cache.get_link_data(link.node1, link.node2)
+            for service_in_link in link_data['running_services']:
+                if service_in_link.service_id == excluded_service_id:
+                    continue
+                if service_in_link.service_id in seen_ids:
+                    continue
+                seen_ids.add(service_in_link.service_id)
+                services_to_measure.append(service_in_link)
+        return services_to_measure
+
+    cdef int _refresh_impacted_services(
+        self,
+        object path,
+        int excluded_service_id,
+        bint count_disruptions
+    ):
+        cdef int disrupted_services = 0
+        cdef list impacted_services
+        cdef Service service
+        cdef bint qot_acceptable
+
+        if not self.measure_disruptions or path is None:
+            return 0
+
+        impacted_services = self._collect_impacted_services(path, excluded_service_id)
+
+        for service in impacted_services:
+            qot_acceptable = self._refresh_service_qot(service)
+            if count_disruptions and not qot_acceptable:
+                disrupted_services += 1
+                if service.service_id not in self.disrupted_services_ids:
+                    self.disrupted_services += 1
+                    self.episode_disrupted_services += 1
+                    self.disrupted_services_ids.add(service.service_id)
+                    self.disrupted_services_list.append(service)
+
+        return disrupted_services
+
     cpdef tuple reset(self, object seed=None, dict options=None):
         self.episode_bit_rate_requested = 0.0
         self.episode_bit_rate_provisioned = 0.0
@@ -553,6 +638,7 @@ cdef class QRMSAEnv:
         self.bit_rate_provisioned = 0.0
         self.disrupted_services = 0
         self.disrupted_services_list = []
+        self.disrupted_services_ids = set()
 
         self.topology.graph["services"] = []
         self.topology.graph["running_services"] = []
@@ -644,7 +730,7 @@ cdef class QRMSAEnv:
                         if self.qot_constraint == "DIST":
                             qot_acceptable = path.length <= modulation.maximum_length
                         else:
-                            osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                            osnr, _, _ = self._calculate_service_osnr(self.current_service)
                             qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
                         
                         self.current_service.path = None
@@ -760,7 +846,7 @@ cdef class QRMSAEnv:
             if self.qot_constraint == "DIST":
                 qot_acceptable = route.length <= modulation.maximum_length
             else:
-                osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                osnr, _, _ = self._calculate_service_osnr(self.current_service)
                 qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
             
             # Reset service
@@ -1080,7 +1166,7 @@ cdef class QRMSAEnv:
             if self.qot_constraint == "DIST":
                 qot_acceptable = route.length <= modulation.maximum_length
             else:
-                osnr, _, _ = calculate_osnr(self, self.current_service, self.qot_constraint)
+                osnr, _, _ = self._calculate_service_osnr(self.current_service)
                 qot_acceptable = osnr >= modulation.minimum_osnr + self.margin
             
             # Limpar configuração temporária
@@ -1416,7 +1502,7 @@ cdef class QRMSAEnv:
                     nli = 0.0
                 else:
                     path_distance = self.current_service.path.length  # For error message
-                    osnr, ase, nli = calculate_osnr(self, self.current_service, self.qot_constraint)
+                    osnr, ase, nli = self._calculate_service_osnr(self.current_service)
                     qot_acceptable = osnr >= osnr_req
 
                 if qot_acceptable:
@@ -1466,32 +1552,11 @@ cdef class QRMSAEnv:
                     )
 
         if self.measure_disruptions and self.current_service.accepted:
-            services_to_measure = []
-            
-            for link in self.current_service.path.links:
-                link_data = self.link_cache.get_link_data(link.node1, link.node2)
-                running_services = link_data['running_services']
-                
-                for service_in_link in running_services:
-                    if (service_in_link not in services_to_measure
-                            and service_in_link not in self.disrupted_services_list):
-                        services_to_measure.append(service_in_link)
-
-            for svc in services_to_measure:
-                if self.qot_constraint == "DIST":
-                    path_distance = svc.path.length
-                    qot_acceptable = path_distance <= svc.current_modulation.maximum_length
-                    osnr_svc = 0.0 if qot_acceptable else -1.0
-                else:
-                    osnr_svc, ase_svc, nli_svc = calculate_osnr(self, svc, self.qot_constraint)
-                    qot_acceptable = osnr_svc >= svc.current_modulation.minimum_osnr
-                
-                if not qot_acceptable:
-                    disrupted_services += 1
-                    if svc not in self.disrupted_services_list:
-                        self.disrupted_services += 1
-                        self.episode_disrupted_services += 1
-                        self.disrupted_services_list.append(svc)
+            disrupted_services = self._refresh_impacted_services(
+                self.current_service.path,
+                self.current_service.service_id,
+                True
+            )
 
         if not self.current_service.accepted:
             if action == (self.action_space.n - 1):
@@ -2556,6 +2621,7 @@ cdef class QRMSAEnv:
             )
 
         self.topology.graph["running_services"].remove(service)
+        self._refresh_impacted_services(service.path, service.service_id, False)
 
 
     cpdef _update_link_stats(self, str node1, str node2):
@@ -2878,7 +2944,7 @@ cdef class QRMSAEnv:
                 ase = 0.0
                 nli = 0.0
             else:
-                osnr, ase, nli = calculate_osnr(self, service, self.qot_constraint)
+                osnr, ase, nli = self._calculate_service_osnr(service)
                 osnr_required = service.current_modulation.minimum_osnr
                 qot_acceptable = osnr >= osnr_required
             

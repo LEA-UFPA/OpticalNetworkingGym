@@ -58,7 +58,7 @@ cpdef calculate_osnr(env: QRMSAEnv, current_service: object, qot_constraint: str
                 if hasattr(env, 'topo_cache') and env.topo_cache is not None:
                     running_services = env.topo_cache.get_running_services(link.node1, link.node2)
                 else:
-                    running_services = []
+                    running_services = link_data.get("running_services", [])
                 
                 for running_service in running_services:
                     if running_service.service_id != current_service.service_id:
@@ -180,7 +180,9 @@ cpdef calculate_osnr_default_attenuation(
             if hasattr(env, 'topo_cache') and env.topo_cache is not None:
                 running_services = env.topo_cache.get_running_services(link.node1, link.node2)
             else:
-                running_services = []
+                running_services = env.topology[link.node1][link.node2].get(
+                    "running_services", []
+                )
             
             for running_service in running_services:
                 if running_service.service_id != current_service.service_id:
@@ -307,7 +309,7 @@ cpdef double calculate_osnr_observation(
             if hasattr(env, 'topo_cache') and env.topo_cache is not None:
                 running_services = env.topo_cache.get_running_services(link.node1, link.node2)
             else:
-                running_services = []
+                running_services = link_data.get("running_services", [])
             
             for running_service in running_services:
                 if running_service.service_id != service_id:
@@ -455,12 +457,21 @@ cpdef bint validate_osnr_vectorized(
     cdef np.ndarray[np.float64_t, ndim=1] individual_values = np.zeros(num_slots, dtype=np.float64)
     cdef double frequency_slot_bandwidth = env.channel_width * 1e9
     cdef double launch_power = 10 ** ((env.launch_power_dbm - 30) / 10)
-    cdef double gsnr_th = 10.0
     cdef int slot
     cdef double service_center_frequency
+    cdef double gsnr_db, ase_db, nli_db
     cdef double max_diff = 0.0
     cdef double diff
     cdef int errors = 0
+    cdef object temp_service = type('TempService', (), {
+        'path': path,
+        'initial_slot': 0,
+        'number_slots': 1,
+        'center_frequency': 0.0,
+        'bandwidth': frequency_slot_bandwidth,
+        'launch_power': launch_power,
+        'service_id': getattr(env.current_service, 'service_id', -999)
+    })()
     
     print(f"[DEBUG] Validating OSNR vectorized function...")
     
@@ -476,15 +487,10 @@ cpdef bint validate_osnr_vectorized(
                 (frequency_slot_bandwidth / 2.0)
             )
             
-            individual_values[slot] = calculate_osnr_observation(
-                env,
-                path.links,
-                frequency_slot_bandwidth,
-                service_center_frequency,
-                env.current_service.service_id,
-                launch_power,
-                gsnr_th
-            )
+            temp_service.initial_slot = slot
+            temp_service.center_frequency = service_center_frequency
+            gsnr_db, ase_db, nli_db = calculate_osnr(env, temp_service, qot_constraint)
+            individual_values[slot] = gsnr_db
         else:
             individual_values[slot] = -1.0
     
