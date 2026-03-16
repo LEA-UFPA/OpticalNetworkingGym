@@ -2,11 +2,22 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python C++ Debug",
-      "type": "pythoncpp",
+      "name": "Depurar Estudo de Margem",
+      "type": "python",
       "request": "launch",
-      "pythonConfig": "default",
-      "cppConfig": "default (win) Attach",
+      "program": "${workspaceFolder}/examples/SbrT_2026/graph_margin.py",
+      "args": [
+        "--threads",
+        "1",
+        "--num_episodes",
+        "1",
+        "--load",
+        "250",
+        "--topology_file",
+        "nsfnet_chen.txt"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false
     }
   ]
 }
